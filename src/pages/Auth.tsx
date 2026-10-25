@@ -1,14 +1,26 @@
 import { useState } from 'react';
 import { Alert, Button, Card, Form } from 'react-bootstrap';
-import { supabase } from './supabaseClient';
-import { validateConfirmPassword, validateEmail, validateName, validatePassword,} from '../shared/authValidation';
+import { supabase } from '../lib/supabase';
+import {
+  validateConfirmPassword,
+  validateEmail,
+  validateName,
+  validatePassword,
+} from '../../shared/authValidation';
 
 type Field = 'name' | 'email' | 'password' | 'confirm';
-type Errors = { name?: string; email?: string; password?: string; confirm?: string; };
+type Errors = {
+  name?: string;
+  email?: string;
+  password?: string;
+  confirm?: string;
+};
+type SignupRole = 'rider' | 'driver' | 'both';
 
-export default function AuthPage() {
+export default function Auth() {
   const [mode, setMode] = useState<'login' | 'signup'>('login');
   const [form, setForm] = useState({ name: '', email: '', password: '', confirm: '' });
+  const [role, setRole] = useState<SignupRole>('both');
   const [errors, setErrors] = useState<Errors>({});
   const [serverError, setServerError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -47,7 +59,8 @@ export default function AuthPage() {
         ? await supabase.auth.signUp({
             email: form.email,
             password: form.password,
-            options: { data: { full_name: form.name.trim() } },
+            // The sign-up trigger reads these to create the users row
+            options: { data: { full_name: form.name.trim(), role } },
           })
         : await supabase.auth.signInWithPassword({ email: form.email, password: form.password });
       if (error) setServerError(error.message);
@@ -63,7 +76,7 @@ export default function AuthPage() {
     setErrors({});
     setServerError(null);
   }
-  
+
   const field = (name: Field, label: string, type: string) => (
     <Form.Group className="mb-3" controlId={name}>
       <Form.Label>{label}</Form.Label>
@@ -79,10 +92,24 @@ export default function AuthPage() {
   );
 
   return (
-    <Card className="mx-auto mt-5 p-4" style={{ maxWidth: 400 }}>
+    <Card className="mx-auto mt-5 p-4" style={{ maxWidth: 420 }}>
       <h2 className="mb-3">{isSignup ? 'Create your Poolr account' : 'Log in to Poolr'}</h2>
       <Form noValidate onSubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
         {isSignup && field('name', 'Full name', 'text')}
+        {isSignup && (
+          <Form.Group className="mb-3" controlId="role">
+            <Form.Label>I want to</Form.Label>
+            <Form.Select
+              value={role}
+              onChange={(e) => setRole(e.target.value as SignupRole)}
+              disabled={loading}
+            >
+              <option value="rider">Find rides (rider)</option>
+              <option value="driver">Offer rides (driver)</option>
+              <option value="both">Both</option>
+            </Form.Select>
+          </Form.Group>
+        )}
         {field('email', 'Email', 'email')}
         {field('password', 'Password', 'password')}
         {isSignup && field('confirm', 'Confirm password', 'password')}
