@@ -1,8 +1,4 @@
-// Poolr Payment Service — Supabase Edge Function
-// Actions: { action: "hold", requestId, paymentMethodId }
-//          { action: "capture", paymentId }
-//          { action: "release", paymentId }
-// Payment amounts and identities are read from Postgres, never trusted from client input.
+
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import Stripe from "npm:stripe@17.7.0";
@@ -14,7 +10,7 @@ const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY")!;
 const PLATFORM_FEE_BPS = Number(Deno.env.get("PLATFORM_FEE_BPS") ?? "0");
 
 const stripe = new Stripe(STRIPE_SECRET_KEY, {
-  apiVersion: "2024-06-20",
+  apiVersion: "2025-02-24.acacia",
   httpClient: Stripe.createFetchHttpClient(),
 });
 
@@ -75,15 +71,19 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
 
   const { data: request, error: requestError } = await admin
     .from("trip_requests")
-    .select("request_id, trip_id, rider_id, offer_fare, request_status")
+    // FIX 1: fare_amount, not offer_fare
+    .select("request_id, trip_id, rider_id, fare_amount, request_status")
     .eq("request_id", requestId)
     .single();
   if (requestError || !request) throw new Error("Trip request not found.");
-  if (request.rider_id !== userId) throw new Error("Only the rider who made this request can pay.",);
+  if (request.rider_id !== userId) throw new Error("Only the rider who made this request can pay.");
   if (request.request_status !== "accepted") {
     throw new Error("The trip request must be accepted before placing a payment hold.");
   }
-  if (request.offer_fare == null) throw new Error("The accepted request has no fare.");
+  // FIX 1 (cont.): fare_amount is set by the database (set_request_fare /
+  // respond_to_offer); offer_fare is only the rider's proposal and is null
+  // for bookings that came from a ride offer.
+  if (request.fare_amount == null) throw new Error("The accepted request has no fare.");
 
   const { data: trip, error: tripError } = await admin
     .from("trips")
@@ -102,7 +102,7 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
     throw new Error("Set up your Stripe customer/payment method before booking.");
   }
 
-const { data: driver, error: driverError } = await admin
+  const { data: driver, error: driverError } = await admin
     .from("users")
     .select("stripe_account_id")
     .eq("user_id", trip.creator_id)
@@ -146,7 +146,7 @@ const { data: driver, error: driverError } = await admin
       return {
         paymentId: existingPayment.payment_id,
         status: existingIntent.status === "succeeded" ? "captured" : "held",
-        amount: Number(request.offer_fare),
+        amount: Number(request.fare_amount), // FIX 1
         currency: "usd",
       };
     }
@@ -159,7 +159,7 @@ const { data: driver, error: driverError } = await admin
   if (methodCustomer !== rider.stripe_customer_id) {
     throw new Error("That payment method is not attached to your account.");
   }
-  const amount = dollarsToCents(request.offer_fare);
+  const amount = dollarsToCents(request.fare_amount); // FIX 1
   const platformFee = Math.min(amount, Math.round(amount * Math.max(0, PLATFORM_FEE_BPS) / 10_000));
 
   // Idempotency prevents duplicate authorizations on client retries.
@@ -195,7 +195,7 @@ const { data: driver, error: driverError } = await admin
     request_id: request.request_id,
     payer_id: userId,
     payee_id: trip.creator_id,
-    amount_total: Number(request.offer_fare),
+    amount_total: Number(request.fare_amount), // FIX 1
     platform_fee: platformFee / 100,
     gas_reimbursement: 0,
     stripe_charge_id: chargeId,
@@ -224,10 +224,10 @@ const { data: driver, error: driverError } = await admin
     };
   }
 
-return {
+  return {
     paymentId: saved.payment_id,
     status: saved.payment_status,
-    amount: Number(request.offer_fare),
+    amount: Number(request.fare_amount), // FIX 1
     currency: "usd",
   };
 }
@@ -306,7 +306,7 @@ async function capturePayment(userId: string, paymentId: string) {
     throw new Error("Payment and payout were processed but the database update failed. Retry safely.");
   }
 
-return { paymentId, status: "captured", transferId: transfer.id };
+  return { paymentId, status: "captured", transferId: transfer.id };
 }
 
 async function releasePayment(userId: string, paymentId: string) {
@@ -336,8 +336,16 @@ async function releasePayment(userId: string, paymentId: string) {
   if (!isCancelled) {
     throw new Error("Payment can only be released when the trip or request is cancelled/declined.");
   }
-  if (payment.payment_status === "refunded") return { paymentId, status: "refunded" };
-  if (payment.payment_status === "captured") {
+  if (payment.payment_status === "refunded" || payment.payment_status === "released") {
+    return { paymentId, status: payment.payment_status };
+  }
+
+  // FIX 2: track whether money was actually captured. A cancelled
+  // authorization (never captured) is a RELEASE, not a refund — the
+  // database guard rejects held -> refunded.
+  let wasCaptured = payment.payment_status === "captured";
+
+  if (wasCaptured) {
     const refund = await stripe.refunds.create({
       payment_intent: payment.stripe_payment_intent_id,
       reason: "requested_by_customer",
@@ -354,6 +362,7 @@ async function releasePayment(userId: string, paymentId: string) {
         idempotencyKey: `poolr-release-${payment.payment_id}`,
       });
     } else if (intent.status === "succeeded") {
+      wasCaptured = true;
       await stripe.refunds.create({
         payment_intent: intent.id,
         reason: "requested_by_customer",
@@ -362,14 +371,17 @@ async function releasePayment(userId: string, paymentId: string) {
     }
   }
 
-
+  const finalStatus = wasCaptured ? "refunded" : "released"; // FIX 2
   const { error: updateError } = await admin
     .from("payments")
-    .update({ payment_status: "refunded", payment_intent_status: "canceled" })
+    .update({
+      payment_status: finalStatus,
+      payment_intent_status: wasCaptured ? "succeeded" : "canceled",
+    })
     .eq("payment_id", payment.payment_id);
   if (updateError) throw new Error("Stripe release/refund succeeded but database update failed. Retry safely.");
 
-  return { paymentId, status: "refunded" };
+  return { paymentId, status: finalStatus };
 }
 
 Deno.serve(async (req: Request) => {
@@ -397,7 +409,7 @@ Deno.serve(async (req: Request) => {
     const message = error instanceof Error ? error.message : "Unexpected payment error.";
     console.error("Poolr payment service error:", message);
     const status = /sign in|session/i.test(message) ? 401
-      : /not found|not a participant|only the rider|only the rider|not authorized/i.test(message) ? 403
+      : /not found|not a participant|only the rider|not authorized/i.test(message) ? 403
       : 400;
     return fail(message, status);
   }
