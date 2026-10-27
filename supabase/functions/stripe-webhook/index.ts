@@ -1,5 +1,3 @@
-
-
 import { createClient } from "npm:@supabase/supabase-js@2";
 import Stripe from "npm:stripe@17.7.0";
 
@@ -13,7 +11,7 @@ if (!stripeSecret || !endpointSecret || !supabaseUrl || !serviceRoleKey) {
 }
 
 const stripe = new Stripe(stripeSecret, {
-  apiVersion: "2024-06-20",
+  apiVersion: "2025-02-24.acacia",
   httpClient: Stripe.createFetchHttpClient(),
 });
 
@@ -82,6 +80,19 @@ Deno.serve(async (req: Request) => {
           .eq("stripe_payment_intent_id", intent.id);
 
         if (error) throw error;
+
+        // FIX: if the intent was cancelled while our row still says "held"
+        // (expired hold, or a cancel that didn't go through the release
+        // function), mark the row released. Scoped to status = 'held' so a
+        // captured/refunded row is never touched.
+        if (event.type === "payment_intent.canceled") {
+          const { error: releaseError } = await admin
+            .from("payments")
+            .update({ payment_status: "released" })
+            .eq("stripe_payment_intent_id", intent.id)
+            .eq("payment_status", "held");
+          if (releaseError) throw releaseError;
+        }
       }
     } else if (event.type === "charge.refunded") {
       const charge = event.data.object as Stripe.Charge;
