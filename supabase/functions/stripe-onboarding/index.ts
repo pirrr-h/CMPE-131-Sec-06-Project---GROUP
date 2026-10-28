@@ -207,22 +207,103 @@ async function riderStatus(userId: string) {
 }
 
 // --------------------------------------------------------------- driver ---
+// Accounts v2 (rewritten 2026-10-28): this Stripe platform rejects v1
+// Express account creation for new Connect integrations ("Stripe no longer
+// recommends Accounts v1... Create connected accounts with
+// POST /v2/core/accounts instead"), so driver accounts are managed through
+// Stripe's v2 REST endpoints directly. The pinned SDK (17.7.0) predates
+// reliable v2 support, so these calls use fetch with the Stripe-Version
+// header Stripe itself specified for this account. The rider side above
+// still uses the v1 SDK — Customers/SetupIntents are unaffected — and v2
+// account ids are plain acct_... ids that payment-service's v1 transfer
+// call accepts unchanged.
+
+const STRIPE_V2_VERSION = "2026-09-30.endive";
+
+// The slices of the v2 Account object this function reads. Configuration
+// sub-objects come back null unless named in the retrieve's include list.
+interface V2Account {
+  id: string;
+  identity?: { country?: string; entity_type?: string | null } | null;
+  configuration?: {
+    merchant?: {
+      capabilities?: { card_payments?: { status?: string } };
+    } | null;
+    recipient?: {
+      capabilities?: {
+        stripe_balance?: { stripe_transfers?: { status?: string } };
+      };
+    } | null;
+  } | null;
+}
+
+async function stripeV2<T>(path: string, method: string, body?: unknown): Promise<T> {
+  const res = await fetch(`https://api.stripe.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+      "Stripe-Version": STRIPE_V2_VERSION,
+      "Content-Type": "application/json",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data: unknown = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = (data as { error?: { message?: string } } | null)?.error?.message ??
+      `Stripe v2 request failed (${res.status}).`;
+    throw new Error(message);
+  }
+  return data as T;
+}
+
+function retrieveV2Account(accountId: string) {
+  const include = [
+    "configuration.merchant",
+    "configuration.recipient",
+    "identity",
+    "requirements",
+  ]
+    .map((name, i) => `include[${i}]=${name}`)
+    .join("&");
+  return stripeV2<V2Account>(`/v2/core/accounts/${accountId}?${include}`, "GET");
+}
 
 async function driverStart(userId: string, email?: string) {
   const profile = await getProfile(userId);
 
   let accountId = profile.stripe_account_id;
+  if (accountId) {
+    // A saved id should resolve in v2 (v2 reads v1-era accounts too). Only
+    // a genuinely missing account falls through to creating a fresh one —
+    // any other Stripe error is the caller's to see, not a cue to duplicate.
+    try {
+      await retrieveV2Account(accountId);
+    } catch (error) {
+      if (!/no such/i.test(error instanceof Error ? error.message : "")) throw error;
+      accountId = null;
+    }
+  }
   if (!accountId) {
-    // Express = Stripe hosts the identity/bank paperwork; Poolr never sees
-    // tax ids or bank details. Save the id BEFORE sending the driver to
-    // Stripe, so a refresh/retry continues the same account instead of
-    // creating duplicates.
-    const account = await stripe.accounts.create({
-      type: "express",
-      email: email ?? undefined,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
+    // Express dashboard = Stripe hosts the identity/bank paperwork; Poolr
+    // never sees tax ids or bank details. fees/losses collector
+    // "application" = the platform (not Stripe, not the driver) absorbs
+    // fees and negative balances, matching the old Express setup. The
+    // merchant capability lets the account take card payments; the
+    // recipient capability lets Poolr transfer trip money into its Stripe
+    // balance. Save the id BEFORE sending the driver to Stripe, so a
+    // refresh/retry continues the same account instead of duplicating it.
+    const account = await stripeV2<V2Account>("/v2/core/accounts", "POST", {
+      contact_email: email ?? undefined,
+      identity: { country: "US" },
+      dashboard: "express",
+      defaults: {
+        responsibilities: { fees_collector: "application", losses_collector: "application" },
+      },
+      configuration: {
+        merchant: { capabilities: { card_payments: { requested: true } } },
+        recipient: {
+          capabilities: { stripe_balance: { stripe_transfers: { requested: true } } },
+        },
       },
       metadata: { poolr_user_id: userId },
     });
@@ -233,11 +314,19 @@ async function driverStart(userId: string, email?: string) {
   // Account links are single-use and short-lived, so a fresh one is minted
   // on every call: refresh_url is where Stripe sends the driver when a link
   // expires or needs a restart, return_url when they finish (or bail out).
-  const link = await stripe.accountLinks.create({
+  // collection_options "eventually_due" collects the full paperwork up
+  // front, like the old Express flow did.
+  const link = await stripeV2<{ url: string }>("/v2/core/account_links", "POST", {
     account: accountId,
-    type: "account_onboarding",
-    refresh_url: `${APP_ORIGIN}/payments?driver=refresh`,
-    return_url: `${APP_ORIGIN}/payments?driver=return`,
+    use_case: {
+      type: "account_onboarding",
+      account_onboarding: {
+        configurations: ["merchant", "recipient"],
+        collection_options: { fields: "eventually_due" },
+        refresh_url: `${APP_ORIGIN}/payments?driver=refresh`,
+        return_url: `${APP_ORIGIN}/payments?driver=return`,
+      },
+    },
   });
 
   return { accountId, url: link.url };
@@ -253,14 +342,27 @@ async function driverStatus(userId: string) {
       payoutsEnabled: false,
     };
   }
-  const account = await stripe.accounts.retrieve(profile.stripe_account_id);
+  const account = await retrieveV2Account(profile.stripe_account_id);
+  const chargesEnabled =
+    account.configuration?.merchant?.capabilities?.card_payments?.status === "active";
+  // v1's payouts_enabled has no direct v2 twin. The gate payment-service
+  // actually needs is transfers INTO the driver's balance, so payoutsEnabled
+  // tracks the recipient stripe_transfers capability; bank payouts from the
+  // balance are then scheduled by Stripe under the recipient configuration.
+  const payoutsEnabled =
+    account.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers
+      ?.status === "active";
+  // v2 has no details_submitted flag either. identity.entity_type is only
+  // set once the driver has been through Stripe's hosted flow and declared
+  // individual/company, so it stands in for "details submitted".
+  const detailsSubmitted = Boolean(account.identity?.entity_type);
   return {
     accountId: profile.stripe_account_id,
-    detailsSubmitted: account.details_submitted ?? false,
-    chargesEnabled: account.charges_enabled ?? false,
-    payoutsEnabled: account.payouts_enabled ?? false,
+    detailsSubmitted,
+    chargesEnabled,
+    payoutsEnabled,
     // Ready = Stripe will actually let capturePayment() transfer to them.
-    accountReady: Boolean(account.charges_enabled && account.payouts_enabled),
+    accountReady: chargesEnabled && payoutsEnabled,
   };
 }
 
