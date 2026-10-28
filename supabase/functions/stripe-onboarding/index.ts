@@ -218,6 +218,18 @@ async function riderStatus(userId: string) {
 // account ids are plain acct_... ids that payment-service's v1 transfer
 // call accepts unchanged.
 
+// How the driver flow works, end to end:
+//   1. The Payments page calls driver_start. If this driver has no saved
+//      Stripe account yet, driver_start creates one (Accounts v2) and
+//      saves its id on the users row; then it mints a one-time onboarding
+//      link and returns the URL.
+//   2. The page sends the driver to that URL — Stripe's own hosted pages
+//      collect the identity and bank details (Poolr never sees them) and
+//      then redirect back to /payments?driver=return (or =refresh if the
+//      link expired unused).
+//   3. The page calls driver_status, which reads the account back from
+//      Stripe and reports whether it is fully ready to receive trip money.
+
 const STRIPE_V2_VERSION = "2026-09-30.endive";
 
 // The slices of the v2 Account object this function reads. Configuration
@@ -237,6 +249,10 @@ interface V2Account {
   } | null;
 }
 
+// stripeV2: sends ONE request to Stripe's v2 REST API and returns the
+// parsed JSON. It attaches the secret key and the pinned v2 version
+// header, and on failure it throws Stripe's own error message, so the
+// driver sees the real reason in the app instead of a generic failure.
 async function stripeV2<T>(path: string, method: string, body?: unknown): Promise<T> {
   const res = await fetch(`https://api.stripe.com${path}`, {
     method,
@@ -256,6 +272,10 @@ async function stripeV2<T>(path: string, method: string, body?: unknown): Promis
   return data as T;
 }
 
+// retrieveV2Account: fetches one v2 account by id. The include list asks
+// Stripe to fill in the configuration, identity, and requirements
+// sections of the account object — without it those sections come back
+// null and the status checks below would read nothing.
 function retrieveV2Account(accountId: string) {
   const include = [
     "configuration.merchant",
@@ -268,6 +288,11 @@ function retrieveV2Account(accountId: string) {
   return stripeV2<V2Account>(`/v2/core/accounts/${accountId}?${include}`, "GET");
 }
 
+// driverStart: backs the "Set up payouts" / "Continue payout setup"
+// button. Reuses the driver's saved v2 account when there is one
+// (creating it on first use and saving its id first), then returns a
+// fresh hosted-onboarding URL for the app to redirect to.
+// Returns { accountId, url }.
 async function driverStart(userId: string, email?: string) {
   const profile = await getProfile(userId);
 
@@ -315,13 +340,15 @@ async function driverStart(userId: string, email?: string) {
   // on every call: refresh_url is where Stripe sends the driver when a link
   // expires or needs a restart, return_url when they finish (or bail out).
   // collection_options "eventually_due" collects the full paperwork up
-  // front, like the old Express flow did.
+  // front, like the old Express flow did. No "configurations" field here:
+  // this account's API version rejects it as unknown (verified live
+  // 2026-10-28) — the link automatically covers the configurations already
+  // applied to the account (merchant + recipient).
   const link = await stripeV2<{ url: string }>("/v2/core/account_links", "POST", {
     account: accountId,
     use_case: {
       type: "account_onboarding",
       account_onboarding: {
-        configurations: ["merchant", "recipient"],
         collection_options: { fields: "eventually_due" },
         refresh_url: `${APP_ORIGIN}/payments?driver=refresh`,
         return_url: `${APP_ORIGIN}/payments?driver=return`,
@@ -332,6 +359,11 @@ async function driverStart(userId: string, email?: string) {
   return { accountId, url: link.url };
 }
 
+// driverStatus: the Payments page's payout status check. Reads the
+// driver's account live from Stripe and translates the v2 capability
+// statuses into the flags the page displays.
+// Returns { accountId, detailsSubmitted, chargesEnabled, payoutsEnabled,
+// accountReady }.
 async function driverStatus(userId: string) {
   const profile = await getProfile(userId);
   if (!profile.stripe_account_id) {
