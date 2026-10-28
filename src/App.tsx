@@ -3,6 +3,7 @@ import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
 import { supabase } from './lib/supabase'
 import { useProfile } from './lib/useProfile'
 import Auth from './pages/Auth'
+import PaymentSetup from './pages/PaymentSetup'
 import PublishRoute from './pages/PublishRoute'
 import Vehicles from './pages/Vehicles'
 
@@ -23,6 +24,7 @@ export default function App() {
           <Nav className="me-auto">
             {canDrive && <Nav.Link as={Link} to="/vehicles">Vehicles</Nav.Link>}
             {canDrive && <Nav.Link as={Link} to="/publish">Publish route</Nav.Link>}
+            <Nav.Link as={Link} to="/payments">Payments</Nav.Link>
           </Nav>
           <span className="me-3">{profile?.full_name ?? session.user.email} ({profile?.role})</span>
           <Button size="sm" variant="outline-secondary" onClick={() => supabase.auth.signOut()}>Log out</Button>
@@ -30,6 +32,7 @@ export default function App() {
       </Navbar>
       <Container>
         <Routes>
+          <Route path="/payments" element={<PaymentSetup userId={userId} />} />
           {canDrive && <Route path="/" element={<Navigate to="/publish" replace />} />}
           {canDrive ? (
             <>
