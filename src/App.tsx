@@ -5,6 +5,7 @@ import { useProfile } from './lib/useProfile'
 import Auth from './pages/Auth'
 import PaymentSetup from './pages/PaymentSetup'
 import PublishRoute from './pages/PublishRoute'
+import TripRequests from './pages/TripRequests'
 import Vehicles from './pages/Vehicles'
 
 export default function App() {
@@ -24,6 +25,7 @@ export default function App() {
           <Nav className="me-auto">
             {canDrive && <Nav.Link as={Link} to="/vehicles">Vehicles</Nav.Link>}
             {canDrive && <Nav.Link as={Link} to="/publish">Publish route</Nav.Link>}
+            {canDrive && <Nav.Link as={Link} to="/requests">Requests</Nav.Link>}
             <Nav.Link as={Link} to="/payments">Payments</Nav.Link>
           </Nav>
           <span className="me-3">{profile?.full_name ?? session.user.email} ({profile?.role})</span>
@@ -38,6 +40,7 @@ export default function App() {
             <>
               <Route path="/vehicles" element={<Vehicles userId={userId} />} />
               <Route path="/publish" element={<PublishRoute userId={userId} />} />
+              <Route path="/requests" element={<TripRequests userId={userId} />} />
             </>
           ) : (
             <Route path="*" element={<p>Rider pages are coming next. Only drivers can publish routes.</p>} />
