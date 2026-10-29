@@ -1,19 +1,17 @@
-// Poolr Payment Service — Supabase Edge Function (CORRECTED 2026-10-27)
-// Changes vs the original are marked with "FIX n" comments:
-//  FIX 1: the payable amount is trip_requests.fare_amount (set by the DB),
-//         NOT offer_fare (the rider's proposal; null for offer-flow bookings).
-//  FIX 2: releasing a hold that was never captured sets status "released",
-//         not "refunded" — the DB guard only allows held -> released and
-//         captured -> refunded.
-//  FIX 3: Stripe apiVersion bumped to "2025-02-24.acacia" — the version
-//         stripe@17.7.0's types require ("2024-06-20" failed deno check).
-// Requires the Poolr-Payment-Alignment-Patch.sql on the database
-// (unique index on payments.request_id, enum values, widened guard map).
+// Poolr Payment Service — Supabase Edge Function.
+//
+// Handles the three money actions for a ride request: placing a hold on
+// the rider's saved card, capturing the hold and paying the driver when
+// the trip completes, and releasing or refunding when it cancels.
+// Payment amounts and identities are always read from Postgres, never
+// trusted from client input.
 //
 // Actions: { action: "hold", requestId, paymentMethodId }
 //          { action: "capture", paymentId }
 //          { action: "release", paymentId }
-// Payment amounts and identities are read from Postgres, never trusted from client input.
+//
+// Requires the Poolr-Payment-Alignment-Patch.sql on the database
+// (unique index on payments.request_id, enum values, widened guard map).
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import Stripe from "npm:stripe@17.7.0";
@@ -39,9 +37,7 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// json(body, status) — Builds the HTTP response for this function.
-// Takes any value, stringifies it to JSON, and returns it with the CORS
-// headers attached so the web app (a different origin) is allowed to read it.
+// Turns a value into a JSON HTTP response with the CORS headers attached.
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -49,16 +45,13 @@ function json(body: unknown, status = 200) {
   });
 }
 
-// fail(message, status) — Shortcut for error responses.
-// Returns { "error": message } as JSON with the given HTTP status code
-// (400 by default; the main handler passes 401/403 for auth problems).
+// Returns an error response carrying the given message and HTTP status.
 function fail(message: string, status = 400) {
   return json({ error: message }, status);
 }
 
-// dollarsToCents(value) — Converts a dollar fare (e.g. 12.34) into the
-// integer cents Stripe requires (1234). Rejects non-numbers and amounts
-// of $0 or less, and enforces Stripe's 50-cent minimum charge.
+// Converts a dollar fare into Stripe's integer cents, rejecting amounts
+// that are missing, not positive, or below Stripe's 50-cent minimum.
 function dollarsToCents(value: number | string | null | undefined): number {
   const amount = Number(value);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid fare amount.");
@@ -67,11 +60,8 @@ function dollarsToCents(value: number | string | null | undefined): number {
   return cents;
 }
 
-// getCaller(req) — Identifies WHO is calling this function.
-// Reads the "Authorization: Bearer <token>" header, asks Supabase Auth to
-// verify the token, and returns the signed-in user. Throws "Sign in
-// required." when there is no token and "Invalid or expired session."
-// when the token fails — this is the function's front door check.
+// Verifies the request's Authorization token with Supabase Auth and
+// returns the signed-in user; throws when there is no valid login.
 async function getCaller(req: Request) {
   const authorization = req.headers.get("Authorization");
   if (!authorization?.startsWith("Bearer ")) throw new Error("Sign in required.");
@@ -85,10 +75,7 @@ async function getCaller(req: Request) {
   return data.user;
 }
 
-// getPayment(paymentId) — Loads one row from the payments table by its
-// payment_id, using the service-role client (bypasses row-level security,
-// which is safe here because callers are authorized before this runs).
-// Throws "Payment not found." when no such row exists.
+// Loads one payment row by id, throwing when it does not exist.
 async function getPayment(paymentId: string) {
   const { data, error } = await admin
     .from("payments")
@@ -99,24 +86,15 @@ async function getPayment(paymentId: string) {
   return data;
 }
 
-// holdPayment(userId, requestId, paymentMethodId) — Places the fare HOLD.
-// This is the booking-time action: it authorizes (but does not yet charge)
-// the rider's card. Steps: (1) load the trip request and check the caller
-// is its rider, the request is "accepted", and the DB has set fare_amount;
-// (2) check the trip is still "posted"; (3) check the rider has a Stripe
-// customer and the driver has a Stripe Connect account; (4) if a
-// PaymentIntent already exists for this request, return/sync its live
-// status instead of double-charging (handles SCA retries); (5) verify the
-// card belongs to this rider's Stripe customer; (6) create a manual-capture
-// PaymentIntent for the fare (idempotency key = one hold per request) and
-// save the payment row as "held". Returns a clientSecret instead when the
-// card needs extra bank authentication (SCA / 3-D Secure).
+// Places a manual-capture hold on the rider's saved card for an accepted
+// request: reads the fare and both Stripe identities from the database,
+// creates and confirms the PaymentIntent, and stores the payment as held.
 async function holdPayment(userId: string, requestId: string, paymentMethodId: string) {
   if (!requestId || !paymentMethodId) throw new Error("requestId and paymentMethodId are required.");
 
   const { data: request, error: requestError } = await admin
     .from("trip_requests")
-    // FIX 1: fare_amount, not offer_fare
+    // The payable amount is fare_amount, which the database sets — not offer_fare.
     .select("request_id, trip_id, rider_id, fare_amount, request_status")
     .eq("request_id", requestId)
     .single();
@@ -125,7 +103,7 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
   if (request.request_status !== "accepted") {
     throw new Error("The trip request must be accepted before placing a payment hold.");
   }
-  // FIX 1 (cont.): fare_amount is set by the database (set_request_fare /
+  // fare_amount is set by the database (set_request_fare /
   // respond_to_offer); offer_fare is only the rider's proposal and is null
   // for bookings that came from a ride offer.
   if (request.fare_amount == null) throw new Error("The accepted request has no fare.");
@@ -191,7 +169,7 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
       return {
         paymentId: existingPayment.payment_id,
         status: existingIntent.status === "succeeded" ? "captured" : "held",
-        amount: Number(request.fare_amount), // FIX 1
+        amount: Number(request.fare_amount),
         currency: "usd",
       };
     }
@@ -204,7 +182,7 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
   if (methodCustomer !== rider.stripe_customer_id) {
     throw new Error("That payment method is not attached to your account.");
   }
-  const amount = dollarsToCents(request.fare_amount); // FIX 1
+  const amount = dollarsToCents(request.fare_amount);
   const platformFee = Math.min(amount, Math.round(amount * Math.max(0, PLATFORM_FEE_BPS) / 10_000));
 
   // Idempotency prevents duplicate authorizations on client retries.
@@ -215,6 +193,9 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
     payment_method: paymentMethodId,
     capture_method: "manual",
     confirm: true,
+    // The saved card is charged directly on the server, so redirect-based
+    // payment methods are turned off for this intent.
+    automatic_payment_methods: { enabled: true, allow_redirects: "never" },
     description: `Poolr ride request ${request.request_id}`,
     metadata: {
       poolr_request_id: request.request_id,
@@ -240,7 +221,7 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
     request_id: request.request_id,
     payer_id: userId,
     payee_id: trip.creator_id,
-    amount_total: Number(request.fare_amount), // FIX 1
+    amount_total: Number(request.fare_amount),
     platform_fee: platformFee / 100,
     gas_reimbursement: 0,
     stripe_charge_id: chargeId,
@@ -272,18 +253,14 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
   return {
     paymentId: saved.payment_id,
     status: saved.payment_status,
-    amount: Number(request.fare_amount), // FIX 1
+    amount: Number(request.fare_amount),
     currency: "usd",
   };
 }
 
-// capturePayment(userId, paymentId) — Collects the held money after the
-// trip is completed, and pays the driver. Checks the trip status is
-// "completed" and the caller is the rider or the driver; captures the
-// PaymentIntent if it is still awaiting capture; then creates a Stripe
-// Transfer of (fare minus platform fee) to the driver's Connect account
-// and marks the payment row "captured" with the transfer id recorded.
-// Safe to retry: idempotency keys prevent a double capture or transfer.
+// Captures a held payment after the trip completes and transfers the
+// driver's share (fare minus the platform fee) to the driver's
+// connected Stripe account.
 async function capturePayment(userId: string, paymentId: string) {
   if (!paymentId) throw new Error("paymentId is required.");
   const payment = await getPayment(paymentId);
@@ -361,13 +338,8 @@ async function capturePayment(userId: string, paymentId: string) {
   return { paymentId, status: "captured", transferId: transfer.id };
 }
 
-// releasePayment(userId, paymentId) — Gives the money back when a trip or
-// request is cancelled/declined. Money moves differently depending on its
-// state: if the fare was only HELD (never captured), the PaymentIntent is
-// cancelled, which frees the rider's card, and the row is marked
-// "released"; if it was already CAPTURED, a real Stripe refund is issued
-// and the row is marked "refunded". Only the rider or the trip's driver
-// may call this, and only for a cancelled/declined trip or request.
+// Frees the rider's money when a trip or request cancels: cancels the
+// hold when it was never captured, or refunds it when it was.
 async function releasePayment(userId: string, paymentId: string) {
   if (!paymentId) throw new Error("paymentId is required.");
   const payment = await getPayment(paymentId);
@@ -399,7 +371,7 @@ async function releasePayment(userId: string, paymentId: string) {
     return { paymentId, status: payment.payment_status };
   }
 
-  // FIX 2: track whether money was actually captured. A cancelled
+  // Track whether money was actually captured. A cancelled
   // authorization (never captured) is a RELEASE, not a refund — the
   // database guard rejects held -> refunded.
   let wasCaptured = payment.payment_status === "captured";
@@ -430,7 +402,7 @@ async function releasePayment(userId: string, paymentId: string) {
     }
   }
 
-  const finalStatus = wasCaptured ? "refunded" : "released"; // FIX 2
+  const finalStatus = wasCaptured ? "refunded" : "released";
   const { error: updateError } = await admin
     .from("payments")
     .update({
@@ -443,13 +415,8 @@ async function releasePayment(userId: string, paymentId: string) {
   return { paymentId, status: finalStatus };
 }
 
-// MAIN ENTRY POINT — Deno.serve handles every incoming HTTP request.
-// OPTIONS requests get a bare CORS "ok". Non-POST requests are rejected
-// (405). For POSTs it authenticates the caller with getCaller(), reads the
-// JSON body's "action" field, and dispatches to holdPayment /
-// capturePayment / releasePayment. Errors are converted to a JSON response
-// whose status is inferred from the message: sign-in problems = 401,
-// permission problems = 403, everything else = 400.
+// Entry point: answers CORS preflights, requires a signed-in caller, and
+// routes each POST to the hold, capture, or release action.
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") return fail("Method not allowed.", 405);
