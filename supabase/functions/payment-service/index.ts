@@ -185,7 +185,9 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
   const amount = dollarsToCents(request.fare_amount);
   const platformFee = Math.min(amount, Math.round(amount * Math.max(0, PLATFORM_FEE_BPS) / 10_000));
 
-  // Idempotency prevents duplicate authorizations on client retries.
+  // Idempotency prevents duplicate authorizations on client retries. The
+  // v2 in the key keeps this request shape separate from the earlier one
+  // Stripe has on record — a key cannot be reused with different parameters.
   const intent = await stripe.paymentIntents.create({
     amount,
     currency: "usd",
@@ -204,7 +206,7 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
       poolr_driver_id: trip.creator_id,
     },
     transfer_group: `poolr_trip_${request.trip_id}`,
-  }, { idempotencyKey: `poolr-hold-${request.request_id}` });
+  }, { idempotencyKey: `poolr-hold-v2-${request.request_id}` });
 
   if (!["requires_action", "requires_capture", "succeeded"].includes(intent.status)) {
     throw new Error(`Payment authorization was not completed (status: ${intent.status}).`);
