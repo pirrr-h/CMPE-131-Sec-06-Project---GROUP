@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Alert, Badge, Button, Card, Col, Form, ListGroup, Row } from 'react-bootstrap'
 import { Link } from 'react-router-dom'
+import MapView from '../components/MapView'
+import type { MapPin } from '../components/MapView'
 import { geocode, getRoute } from '../lib/geocode'
 import { supabase } from '../lib/supabase'
 
@@ -19,12 +21,19 @@ interface Trip {
   available_seats: number
   origin_address: string
   destination_address: string
+  origin_latitude: number | null
+  origin_longitude: number | null
+  destination_latitude: number | null
+  destination_longitude: number | null
+  route_polyline: string | null
 }
 
 function fetchTrips(userId: string) {
   return supabase
     .from('trips')
-    .select('trip_id, trip_status, departure_time, available_seats, origin_address, destination_address')
+        .select(
+      'trip_id, trip_status, departure_time, available_seats, origin_address, destination_address, origin_latitude, origin_longitude, destination_latitude, destination_longitude, route_polyline',
+    )
     .eq('creator_id', userId)
     .order('departure_time', { ascending: false })
 }
@@ -40,6 +49,34 @@ export default function PublishRoute({ userId }: { userId: string }) {
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const [busy, setBusy] = useState(false)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const shownTrip = trips.find((t) => t.trip_id === selectedId) ?? trips[0]
+
+  const pins = useMemo<MapPin[]>(() => {
+    if (
+      !shownTrip ||
+      shownTrip.origin_latitude == null ||
+      shownTrip.origin_longitude == null ||
+      shownTrip.destination_latitude == null ||
+      shownTrip.destination_longitude == null
+    ) {
+      return []
+    }
+    return [
+      {
+        lat: shownTrip.origin_latitude,
+        lng: shownTrip.origin_longitude,
+        label: `From: ${shownTrip.origin_address}`,
+        color: '#16a34a',
+      },
+      {
+        lat: shownTrip.destination_latitude,
+        lng: shownTrip.destination_longitude,
+        label: `To: ${shownTrip.destination_address}`,
+        color: '#dc2626',
+      },
+    ]
+  }, [shownTrip])
 
   const loadTrips = useCallback(async () => {
     const { data } = await fetchTrips(userId)
@@ -165,10 +202,23 @@ export default function PublishRoute({ userId }: { userId: string }) {
       </Card>
 
       <h3>My published routes</h3>
+      {shownTrip && (
+        <Card className="mb-3">
+          <Card.Body>
+            <MapView pins={pins} routePolyline={shownTrip.route_polyline} height={320} />
+          </Card.Body>
+        </Card>
+      )}
       <ListGroup>
         {trips.length === 0 && <ListGroup.Item>Nothing published yet.</ListGroup.Item>}
         {trips.map((t) => (
-          <ListGroup.Item key={t.trip_id} className="d-flex justify-content-between align-items-center">
+          <ListGroup.Item
+            key={t.trip_id}
+            className="d-flex justify-content-between align-items-center"
+            active={t.trip_id === shownTrip?.trip_id}
+            onClick={() => setSelectedId(t.trip_id)}
+            style={{ cursor: 'pointer' }}
+          >
             <div>
               <div>
                 {t.origin_address} → {t.destination_address}
@@ -179,7 +229,14 @@ export default function PublishRoute({ userId }: { userId: string }) {
               </small>
             </div>
             {t.trip_status === 'posted' && (
-              <Button size="sm" variant="outline-danger" onClick={() => cancelTrip(t.trip_id)}>
+              <Button
+                size="sm"
+                variant="outline-danger"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  cancelTrip(t.trip_id)
+                }}
+              >
                 Cancel
               </Button>
             )}
