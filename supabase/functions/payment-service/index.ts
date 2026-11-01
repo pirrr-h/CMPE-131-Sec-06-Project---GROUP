@@ -8,7 +8,7 @@
 //
 // Actions: { action: "hold", requestId, paymentMethodId }
 //          { action: "capture", paymentId }
-//          { action: "release", paymentId }
+//          { action: "release", paymentId, refundPercent? }
 //
 // Requires the Poolr-Payment-Alignment-Patch.sql on the database
 // (unique index on payments.request_id, enum values, widened guard map).
@@ -21,6 +21,11 @@ const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY")!;
 const PLATFORM_FEE_BPS = Number(Deno.env.get("PLATFORM_FEE_BPS") ?? "0");
+
+// On a cancellation where the rider does not get a full refund, the
+// fare splits two ways with no platform fee: the rider is refunded the
+// job's refundPercent and the driver keeps the rest as a maintenance
+// share for the distance already covered toward the ride.
 
 const stripe = new Stripe(STRIPE_SECRET_KEY, {
   apiVersion: "2025-02-24.acacia",
@@ -74,6 +79,22 @@ async function getCaller(req: Request) {
   if (error || !data.user) throw new Error("Invalid or expired session.");
   return data.user;
 }
+
+// The payments-table fields this function reads. Amounts arrive as
+// number or string (Postgres numeric), and the Stripe ids are null
+// until the matching Stripe object exists.
+type PaymentRow = {
+  payment_id: string;
+  trip_id: string;
+  request_id: string;
+  payer_id: string;
+  payee_id: string;
+  amount_total: number | string;
+  platform_fee: number | string | null;
+  payment_status: string;
+  stripe_payment_intent_id: string | null;
+  stripe_transfer_id: string | null;
+};
 
 // Loads one payment row by id, throwing when it does not exist.
 async function getPayment(paymentId: string) {
@@ -340,10 +361,104 @@ async function capturePayment(userId: string, paymentId: string) {
   return { paymentId, status: "captured", transferId: transfer.id };
 }
 
+// settlePartialOrNone: moves the money for a cancellation where the
+// rider does NOT get a full refund (refundPercent 0–99, decided by the
+// database's distance-based cancellation policy). The hold is captured
+// in full first; then the rider is refunded refundPercent of the fare
+// and the driver is transferred the remaining (100 - refundPercent)%
+// as a maintenance share for the distance already covered — there is
+// no platform fee. The payments row ends 'captured' (0%: no refund at
+// all, the driver keeps the whole fare) or 'partially_refunded'.
+// Stripe idempotency keys match the other capture/refund/transfer
+// calls, so this function and the payment drainer can never move the
+// same money twice.
+async function settlePartialOrNone(payment: PaymentRow, refundPercent: number) {
+  if (!payment.stripe_payment_intent_id) throw new Error("Payment has no Stripe PaymentIntent.");
+  const totalCents = dollarsToCents(payment.amount_total);
+
+  let intent = await stripe.paymentIntents.retrieve(payment.stripe_payment_intent_id);
+  if (intent.status === "requires_capture") {
+    intent = await stripe.paymentIntents.capture(intent.id, {}, {
+      idempotencyKey: `poolr-capture-${payment.payment_id}`,
+    });
+  }
+  if (intent.status !== "succeeded") {
+    throw new Error(`Cannot settle a cancelled payment in Stripe status ${intent.status}.`);
+  }
+  const chargeId = typeof intent.latest_charge === "string"
+    ? intent.latest_charge
+    : intent.latest_charge?.id;
+  if (!chargeId) throw new Error("Captured payment has no charge ID.");
+
+  if (payment.payment_status !== "captured") {
+    const { error: captureSaveError } = await admin
+      .from("payments")
+      .update({
+        payment_status: "captured",
+        payment_intent_status: "succeeded",
+        stripe_charge_id: chargeId,
+      })
+      .eq("payment_id", payment.payment_id);
+    if (captureSaveError) throw new Error("Capture succeeded but database update failed. Retry safely.");
+  }
+
+  const driverPercent = 100 - refundPercent;
+
+  if (refundPercent > 0) {
+    const refund = await stripe.refunds.create({
+      payment_intent: payment.stripe_payment_intent_id,
+      amount: Math.round(totalCents * refundPercent / 100),
+      reason: "requested_by_customer",
+      metadata: { poolr_payment_id: payment.payment_id },
+    }, { idempotencyKey: `poolr-prefund-${payment.payment_id}` });
+    if (refund.status === "failed" || refund.status === "canceled") {
+      throw new Error("Stripe could not refund this payment. Contact support.");
+    }
+  }
+
+  // Pay the driver's maintenance share — everything the rider did not
+  // get back — to their connected account.
+  const { data: driver, error: driverError } = await admin
+    .from("users")
+    .select("stripe_account_id")
+    .eq("user_id", payment.payee_id)
+    .single();
+  if (driverError || !driver?.stripe_account_id) {
+    throw new Error("Driver payout account is missing. Refund done; driver share requires support.");
+  }
+  const transfer = await stripe.transfers.create({
+    amount: Math.round(totalCents * driverPercent / 100),
+    currency: "usd",
+    destination: driver.stripe_account_id,
+    source_transaction: chargeId,
+    transfer_group: `poolr_trip_${payment.trip_id}`,
+    metadata: { poolr_payment_id: payment.payment_id, poolr_trip_id: payment.trip_id },
+  }, { idempotencyKey: `poolr-transfer-${payment.payment_id}` });
+
+  const settledStatus = refundPercent === 0 ? "captured" : "partially_refunded";
+  const { error: finalSaveError } = await admin
+    .from("payments")
+    .update({
+      payment_status: settledStatus,
+      stripe_transfer_id: transfer.id,
+    })
+    .eq("payment_id", payment.payment_id);
+  if (finalSaveError) throw new Error("Refund and driver share succeeded but database update failed. Retry safely.");
+
+  return { paymentId: payment.payment_id, status: settledStatus, refundPercent, transferId: transfer.id };
+}
+
 // Frees the rider's money when a trip or request cancels: cancels the
-// hold when it was never captured, or refunds it when it was.
-async function releasePayment(userId: string, paymentId: string) {
+// hold when it was never captured, or refunds it when it was. A
+// refundPercent below 100 (the database's distance-based cancellation
+// policy: 0 for an in-progress trip, otherwise 100 minus the percent of
+// the total distance the driver had covered) settles through
+// settlePartialOrNone instead.
+async function releasePayment(userId: string, paymentId: string, refundPercent = 100) {
   if (!paymentId) throw new Error("paymentId is required.");
+  if (!Number.isInteger(refundPercent) || refundPercent < 0 || refundPercent > 100) {
+    throw new Error("refundPercent must be a whole number between 0 and 100.");
+  }
   const payment = await getPayment(paymentId);
 
   const { data: trip, error: tripError } = await admin
@@ -369,9 +484,14 @@ async function releasePayment(userId: string, paymentId: string) {
   if (!isCancelled) {
     throw new Error("Payment can only be released when the trip or request is cancelled/declined.");
   }
-  if (payment.payment_status === "refunded" || payment.payment_status === "released") {
+  if (payment.payment_status === "refunded" || payment.payment_status === "released"
+    || payment.payment_status === "partially_refunded") {
     return { paymentId, status: payment.payment_status };
   }
+
+  // Policy settlement: anything below a full refund goes through the
+  // capture-first path (partial refund + driver share, or no refund).
+  if (refundPercent < 100) return settlePartialOrNone(payment, refundPercent);
 
   // Track whether money was actually captured. A cancelled
   // authorization (never captured) is a RELEASE, not a refund — the
@@ -434,7 +554,11 @@ Deno.serve(async (req: Request) => {
     } else if (action === "capture") {
       result = await capturePayment(caller.id, body.paymentId);
     } else if (action === "release") {
-      result = await releasePayment(caller.id, body.paymentId);
+      result = await releasePayment(
+        caller.id,
+        body.paymentId,
+        body.refundPercent == null ? 100 : Number(body.refundPercent),
+      );
     } else {
       return fail("Unsupported action. Use hold, capture, or release.");
     }
