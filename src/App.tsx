@@ -3,7 +3,10 @@ import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
 import { supabase } from './lib/supabase'
 import { useProfile } from './lib/useProfile'
 import Auth from './pages/Auth'
+import FindTrips from './pages/FindTrips'
+import PaymentSetup from './pages/PaymentSetup'
 import PublishRoute from './pages/PublishRoute'
+import TripRequests from './pages/TripRequests'
 import Vehicles from './pages/Vehicles'
 
 export default function App() {
@@ -14,6 +17,7 @@ export default function App() {
 
   const userId = session.user.id
   const canDrive = profile?.role === 'driver' || profile?.role === 'both' || profile?.role === 'admin'
+  const canRide = profile?.role === 'rider' || profile?.role === 'both' || profile?.role === 'admin'
 
   return (
     <BrowserRouter>
@@ -21,8 +25,11 @@ export default function App() {
         <Container>
           <Navbar.Brand as={Link} to="/">Poolr</Navbar.Brand>
           <Nav className="me-auto">
+            {canRide && <Nav.Link as={Link} to="/find">Find a trip</Nav.Link>}
             {canDrive && <Nav.Link as={Link} to="/vehicles">Vehicles</Nav.Link>}
             {canDrive && <Nav.Link as={Link} to="/publish">Publish route</Nav.Link>}
+            {canDrive && <Nav.Link as={Link} to="/requests">Requests</Nav.Link>}
+            <Nav.Link as={Link} to="/payments">Payments</Nav.Link>
           </Nav>
           <span className="me-3">{profile?.full_name ?? session.user.email} ({profile?.role})</span>
           <Button size="sm" variant="outline-secondary" onClick={() => supabase.auth.signOut()}>Log out</Button>
@@ -30,11 +37,15 @@ export default function App() {
       </Navbar>
       <Container>
         <Routes>
+          <Route path="/payments" element={<PaymentSetup userId={userId} />} />
+          {canRide && <Route path="/find" element={<FindTrips userId={userId} />} />}
           {canDrive && <Route path="/" element={<Navigate to="/publish" replace />} />}
+          {!canDrive && canRide && <Route path="/" element={<Navigate to="/find" replace />} />}
           {canDrive ? (
             <>
               <Route path="/vehicles" element={<Vehicles userId={userId} />} />
               <Route path="/publish" element={<PublishRoute userId={userId} />} />
+              <Route path="/requests" element={<TripRequests userId={userId} />} />
             </>
           ) : (
             <Route path="*" element={<p>Rider pages are coming next. Only drivers can publish routes.</p>} />
