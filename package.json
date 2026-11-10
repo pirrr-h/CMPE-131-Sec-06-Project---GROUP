@@ -12,6 +12,8 @@
     "test:cov": "jest --coverage"
   },
   "dependencies": {
+    "@stripe/react-stripe-js": "^7.0.1",
+    "@stripe/stripe-js": "^10.2.0",
     "@supabase/supabase-js": "^2.118.0",
     "bootstrap": "^5.3.8",
     "mapbox-gl": "^3.33.0",
