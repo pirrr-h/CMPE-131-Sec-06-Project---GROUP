@@ -1,6 +1,6 @@
 // Poolr Identity Verification — Supabase Edge Function
 //
-// Why this exists: Kyaw's rule is that a Poolr account gets access to
+// Why this exists: rule is that a Poolr account gets access to
 // nothing until the user's identity is verified. Verification runs through
 // Stripe Identity (a hosted document scan — the ID images go to Stripe,
 // never to this server or the database). When Stripe confirms the scan,
@@ -24,6 +24,15 @@
 //        when the user returns from the scan and on every login while
 //        unverified, which also self-heals a scan that finished after the
 //        user closed the tab.
+//
+// Failed attempts also notify: when the status action finds the saved
+// session canceled, or back at requires_input with a Stripe error on it
+// (a scan that did not pass), it writes a notification through the
+// database's notify_user helper, so the pop-up display and push drainer
+// can tell the user even if they closed the tab. Failures are deduped
+// per Stripe session (see notifyIdentityFailure), and the app calls
+// status on every login while unverified, so the dedupe is what keeps
+// that from stacking copies.
 //
 // The user id comes only from the caller's JWT; nothing about identity or
 // verification state is ever trusted from client input.
@@ -111,6 +120,58 @@ async function markVerified(userId: string) {
   if (error) throw new Error("Could not save your verified status. Try again.");
 }
 
+// Write one notification row for the user through the database helper
+// the trip workflows use, so the pop-up display and the push drainer
+// deliver it with no app changes. Best effort on purpose: a failed
+// notification write must never change the verification outcome, so
+// the result and any error are ignored here.
+async function notifyUser(userId: string, type: string, title: string, body: string) {
+  await admin.rpc("notify_user", {
+    p_user_id: userId,
+    p_type: type,
+    p_title: title,
+    p_body: body,
+    p_trip_id: null,
+    p_request_id: null,
+  });
+}
+
+// True when this identity failure was already notified for the Stripe
+// session that produced it: a notification with the same type and
+// title written after the session was created means an earlier status
+// check already told the user. A later session has a later creation
+// time, so a genuinely new failure still notifies.
+async function identityFailureAlreadyNotified(
+  userId: string,
+  title: string,
+  sessionCreatedUnix: number | null,
+) {
+  let query = admin
+    .from("notifications")
+    .select("created_at")
+    .eq("user_id", userId)
+    .eq("type", "identity_verification_failed")
+    .eq("title", title);
+  if (sessionCreatedUnix) {
+    query = query.gt("created_at", new Date(sessionCreatedUnix * 1000).toISOString());
+  }
+  const { data } = await query.limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
+// Tell the user an identity verification failed, once per session and
+// failure kind, so repeated status checks cannot spam them with
+// copies of the same failure.
+async function notifyIdentityFailure(
+  userId: string,
+  title: string,
+  body: string,
+  sessionCreatedUnix: number | null,
+) {
+  if (await identityFailureAlreadyNotified(userId, title, sessionCreatedUnix)) return;
+  await notifyUser(userId, "identity_verification_failed", title, body);
+}
+
 // Create a new Stripe Identity VerificationSession (document scan) for the
 // caller and return the hosted URL the browser should be sent to.
 async function startVerification(userId: string, returnUrl: unknown) {
@@ -146,6 +207,21 @@ async function getVerificationStatus(userId: string) {
   if (session.status === "verified") {
     await markVerified(userId);
     return { verified: true, status: "verified" };
+  }
+  if (session.status === "canceled") {
+    await notifyIdentityFailure(
+      userId,
+      "Identity verification canceled",
+      "Your identity verification was canceled before it finished. Open Poolr to start it again.",
+      session.created,
+    );
+  } else if (session.status === "requires_input" && session.last_error) {
+    await notifyIdentityFailure(
+      userId,
+      "Identity verification failed",
+      "Your identity verification did not pass. Open Poolr to see the state of the check and try again.",
+      session.created,
+    );
   }
   return { verified: false, status: session.status };
 }
