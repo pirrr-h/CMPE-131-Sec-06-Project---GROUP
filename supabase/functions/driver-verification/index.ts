@@ -499,19 +499,16 @@ function checkDocument(
     namesMatch(doc.holderName, profile.full_name);
   if (!nameOk) problems.push("holder name does not match the verified driver name");
 
-  let vinOk = true;
   if (vehicleVin) {
-    vinOk = normalizeVin(doc.vin) === normalizeVin(vehicleVin);
-    if (!vinOk) problems.push("document VIN does not match the vehicle VIN");
+    if (normalizeVin(doc.vin) !== normalizeVin(vehicleVin)) {
+      problems.push("document VIN does not match the vehicle VIN");
+    }
   }
 
-  let expiryOk = true;
   if (doc.docType === "insurance") {
     if (!doc.expiryDate) {
-      expiryOk = false;
       problems.push("insurance expiry date is required");
     } else if (isPastDate(doc.expiryDate)) {
-      expiryOk = false;
       problems.push("insurance has expired");
     }
   }
