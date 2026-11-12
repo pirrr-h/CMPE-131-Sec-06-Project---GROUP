@@ -9,8 +9,9 @@
 //   'pending', looks up the recipient's Firebase Cloud Messaging tokens
 //   in push_tokens, sends one FCM push per token through the FCM HTTP v1
 //   API, and records the outcome on the notification row (sent, no
-//   device, retry, or failed). The inbox row is untouched by delivery —
-//   a user with no registered browser still sees everything in the app.
+//   device, retry, or failed). Delivery never changes what the row
+//   says — and a user whose app is open sees the event as an in-app
+//   pop-up over Realtime whether or not a push went out.
 //
 // How it runs:
 //   pg_cron calls it every minute (see Poolr-Notifications-Cron.sql)
@@ -36,7 +37,7 @@
 //     twice. A claim older than 10 minutes is treated as abandoned and
 //     returned to 'pending'.
 //   - A user with no registered token is marked 'no_device' and never
-//     retried — the inbox row still shows in the app.
+//     retried — an open app still shows the event as a pop-up.
 //   - A token Firebase reports as UNREGISTERED is deleted from
 //     push_tokens, so dead browsers stop being tried.
 //   - A temporary FCM failure returns the row to 'pending' with the
@@ -222,7 +223,7 @@ async function sendPushToToken(
             request_id: notification.request_id ?? "",
           },
           webpush: {
-            fcm_options: { link: "/notifications" },
+            fcm_options: { link: "/" },
           },
         },
       }),
