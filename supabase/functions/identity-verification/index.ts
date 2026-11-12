@@ -124,16 +124,18 @@ async function markVerified(userId: string) {
 // the trip workflows use, so the pop-up display and the push drainer
 // deliver it with no app changes. Best effort on purpose: a failed
 // notification write must never change the verification outcome, so
-// the result and any error are ignored here.
+// an error here is only logged, never thrown.
 async function notifyUser(userId: string, type: string, title: string, body: string) {
-  await admin.rpc("notify_user", {
-    p_user_id: userId,
+  const { error } = await admin.rpc("notify_user", {
+    p_user: userId,
     p_type: type,
     p_title: title,
     p_body: body,
-    p_trip_id: null,
-    p_request_id: null,
+    p_trip: null,
+    p_request: null,
   });
+  if (error) console.log("notify_user write failed:", error.message);
+  else console.log("notify_user wrote:", type, "for user", userId);
 }
 
 // True when this identity failure was already notified for the Stripe
