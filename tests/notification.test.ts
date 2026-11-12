@@ -4,16 +4,18 @@
 // work at all: the Firebase project config in src/lib/firebase.ts and
 // in the service worker (which is served outside the Vite build, so
 // its copy is typed separately and can silently drift), the VAPID key
-// shape, the database RPC names the client calls, and the inbox route
-// the pushes link to.
+// shape, the database RPC names the client calls, and the pop-up
+// wiring (Kyaw's rule: no notifications page — pop-ups that appear
+// and disappear on their own).
 
 // The repo's Jest tsconfig loads only the jest types, so the two Node
 // built-ins used here are declared locally instead of imported.
 declare const __dirname: string
 declare function require(name: string): unknown
 
-const { readFileSync } = require('fs') as {
+const { readFileSync, existsSync } = require('fs') as {
   readFileSync: (path: string, encoding: string) => string
+  existsSync: (path: string) => boolean
 }
 const { join } = require('path') as {
   join: (...parts: string[]) => string
@@ -24,6 +26,11 @@ const root = join(__dirname, '..')
 // Reads one delivered file as text for contract assertions.
 function read(relativePath: string): string {
   return readFileSync(join(root, relativePath), 'utf8')
+}
+
+// Reports whether one delivered file exists in the package.
+function exists(relativePath: string): boolean {
+  return existsSync(join(root, relativePath))
 }
 
 describe('firebase client config', () => {
@@ -56,10 +63,11 @@ describe('service worker', () => {
     expect(sw).toContain("apiKey: 'AIzaSyBJkuWI1XOZp7uXmZNrKC9mWres4JBDdII'")
   })
 
-  test('handles background messages and clicks', () => {
+  test('handles background messages and clicks open the app home', () => {
     expect(sw).toContain('onBackgroundMessage')
     expect(sw).toContain('notificationclick')
-    expect(sw).toContain('/notifications')
+    expect(sw).toContain("const target = '/'")
+    expect(sw).not.toContain('/notifications')
   })
 })
 
@@ -71,19 +79,33 @@ describe('client database calls', () => {
     expect(notificationsTs).toContain("rpc('unregister_push_token'")
   })
 
-  test('reads the notifications table for the inbox and badge', () => {
-    expect(notificationsTs).toContain("from('notifications')")
-    expect(notificationsTs).toContain("is('read_at', null)")
+  test('feeds the pop-ups from a Realtime insert subscription', () => {
+    expect(notificationsTs).toContain('useNotificationPopups')
+    expect(notificationsTs).toContain("'postgres_changes'")
+    expect(notificationsTs).toContain("event: 'INSERT'")
+    expect(notificationsTs).toContain("table: 'notifications'")
   })
 })
 
 describe('app wiring', () => {
   const appTsx = read('src/App.tsx')
+  const popupsTsx = read('src/components/NotificationPopups.tsx')
 
-  test('routes the inbox page and shows it in the nav', () => {
-    expect(appTsx).toContain('path="/notifications"')
-    expect(appTsx).toContain('to="/notifications"')
+  test('renders the pop-ups and registers for push', () => {
+    expect(appTsx).toContain('NotificationPopups')
     expect(appTsx).toContain('usePushRegistration')
-    expect(appTsx).toContain('useUnreadNotificationCount')
+    expect(popupsTsx).toContain('useNotificationPopups')
+  })
+
+  test('pop-ups disappear on their own', () => {
+    expect(popupsTsx).toContain('autohide')
+    expect(popupsTsx).toContain('POPUP_DISPLAY_MS')
+  })
+
+  test('there is no notifications page or route', () => {
+    expect(appTsx).not.toContain('path="/notifications"')
+    expect(appTsx).not.toContain('to="/notifications"')
+    expect(appTsx).not.toContain('pages/Notifications')
+    expect(exists('src/pages/Notifications.tsx')).toBe(false)
   })
 })
