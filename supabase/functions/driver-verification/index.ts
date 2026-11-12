@@ -197,9 +197,9 @@ async function markLicenseVerified(userId: string, name: string | null, expiry: 
 // the trip workflows use, so the pop-up display and the push drainer
 // deliver it with no app changes. Best effort on purpose: a failed
 // notification write must never change the verification outcome, so
-// the result and any error are ignored here.
+// an error here is only logged, never thrown.
 async function notifyUser(userId: string, type: string, title: string, body: string) {
-  await admin.rpc("notify_user", {
+  const { error } = await admin.rpc("notify_user", {
     p_user_id: userId,
     p_type: type,
     p_title: title,
@@ -207,6 +207,8 @@ async function notifyUser(userId: string, type: string, title: string, body: str
     p_trip_id: null,
     p_request_id: null,
   });
+  if (error) console.log("notify_user write failed:", error.message);
+  else console.log("notify_user wrote:", type, "for user", userId);
 }
 
 // True when this license failure was already notified for the Stripe
@@ -241,7 +243,11 @@ async function notifyLicenseFailure(
   body: string,
   sessionCreatedUnix: number | null,
 ) {
-  if (await licenseFailureAlreadyNotified(userId, title, sessionCreatedUnix)) return;
+  if (await licenseFailureAlreadyNotified(userId, title, sessionCreatedUnix)) {
+    console.log("license-status: this failure was already notified, skipping");
+    return;
+  }
+  console.log("license-status: writing failure notification:", title);
   await notifyUser(userId, "license_verification_failed", title, body);
 }
 
@@ -330,6 +336,12 @@ async function startLicenseVerification(userId: string, returnUrl: unknown) {
 // not expired.
 async function getLicenseStatus(userId: string) {
   const profile = await getProfile(userId);
+  console.log(
+    "license-status: user",
+    userId,
+    "license flag:",
+    profile.driver_license_verified,
+  );
   if (profile.driver_license_verified) {
     return {
       licenseVerified: true,
@@ -339,13 +351,34 @@ async function getLicenseStatus(userId: string) {
     };
   }
 
-  const adopted = await adoptIdentityLicense(userId, profile);
+  // Adoption is an optional shortcut: if reading the identity session
+  // throws, log it and fall through to the license session below
+  // instead of letting the whole status check die silently.
+  let adopted: Awaited<ReturnType<typeof adoptIdentityLicense>> = null;
+  try {
+    adopted = await adoptIdentityLicense(userId, profile);
+  } catch (err) {
+    console.log(
+      "license-status: adoption check threw:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  console.log("license-status: adopted:", adopted ? "yes" : "no");
   if (adopted) return adopted;
 
   const sessionId = profile.driver_license_session_id as string | null;
+  console.log("license-status: tracked session:", sessionId);
   if (!sessionId) return { licenseVerified: false, status: "not_started" };
 
   const session = await stripe.identity.verificationSessions.retrieve(sessionId);
+  console.log(
+    "license-status: session state:",
+    session.status,
+    "| last_error:",
+    session.last_error ? (session.last_error.code ?? "present") : "none",
+    "| report:",
+    session.last_verification_report ? "present" : "none",
+  );
   // A failed attempt returns the session to requires_input. Stripe
   // usually attaches last_error, but a failed attempt can also come
   // back carrying only its failed verification report, so the
@@ -641,6 +674,8 @@ Deno.serve(async (req: Request) => {
   try {
     return await handle(req);
   } catch (error) {
-    return fail(error instanceof Error ? error.message : "Driver verification failed.", 400);
+    const message = error instanceof Error ? error.message : "Driver verification failed.";
+    console.log("driver-verification: request failed:", message);
+    return fail(message, 400);
   }
 });
