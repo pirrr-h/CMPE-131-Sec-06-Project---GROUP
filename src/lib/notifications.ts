@@ -11,15 +11,18 @@
 //      never go to the previous account.
 //   3. The database writes notification rows for trip events; the
 //      notification-drainer Edge Function reads push_tokens and sends
-//      the FCM pushes; the Notifications page reads the same rows as an
-//      in-app inbox (RLS: each user sees only their own).
+//      the FCM pushes for when the app is closed. While the app IS
+//      open, useNotificationPopups watches the same rows over Realtime
+//      and shows each new one as a pop-up that disappears on its own.
+//      There is no notifications page (Kyaw's call, 2026-11-12):
+//      pop-ups only.
 
 import { useEffect, useRef, useState } from 'react'
 import { deleteToken, getToken } from 'firebase/messaging'
 import { FIREBASE_VAPID_KEY, getFirebaseMessaging } from './firebase'
 import { supabase } from './supabase'
 
-// One row of the notifications table, as the inbox page displays it.
+// One row of the notifications table, as the pop-ups display it.
 export interface PoolrNotification {
   notification_id: string
   user_id: string
@@ -39,7 +42,7 @@ const TOKEN_STORAGE_KEY = 'poolr-fcm-token'
 // Asks the browser for notification permission, gets this browser's
 // FCM token, and saves it to push_tokens for the signed-in user.
 // Returns a short status string; every failure is a quiet status, not
-// an exception — push is an enhancement, the inbox works without it.
+// an exception — push is an enhancement, never a blocker.
 export async function registerPushNotifications(): Promise<string> {
   try {
     const messaging = await getFirebaseMessaging()
@@ -95,86 +98,44 @@ export function usePushRegistration(userId: string | null) {
   }, [userId])
 }
 
-// Tracks the signed-in user's unread notification count for the nav
-// badge: an initial count query, then a Realtime subscription that
-// recounts whenever the user's notification rows change. The count is
-// stored together with the user it belongs to, so a signed-out or
-// switched account never shows the previous user's number.
-export function useUnreadNotificationCount(userId: string | null) {
-  const [badge, setBadge] = useState<{ userId: string | null; count: number }>({
-    userId: null,
-    count: 0,
-  })
+// Collects the signed-in user's new notifications as pop-ups while the
+// app is open: a Realtime subscription appends each inserted row, and
+// dismissPopup removes one (the pop-up component also calls it when a
+// pop-up's display time runs out, so pop-ups disappear on their own).
+// Only rows created after the subscription starts appear — nothing is
+// loaded from history, because there is no inbox to catch up on.
+export function useNotificationPopups(userId: string | null) {
+  const [popups, setPopups] = useState<PoolrNotification[]>([])
+
+  // Removes one pop-up from the stack by its notification id.
+  function dismissPopup(notificationId: string) {
+    setPopups((current) => current.filter((popup) => popup.notification_id !== notificationId))
+  }
 
   useEffect(() => {
     if (!userId) return
-    let cancelled = false
 
-    // Counts this user's unread rows (head request: no rows returned).
-    function refresh() {
-      supabase
-        .from('notifications')
-        .select('notification_id', { count: 'exact', head: true })
-        .eq('user_id', userId)
-        .is('read_at', null)
-        .then(({ count, error }) => {
-          if (!cancelled && !error) setBadge({ userId, count: count ?? 0 })
-        })
-    }
-
-    refresh()
     const channel = supabase
-      .channel(`notifications-badge-${userId}`)
+      .channel(`notification-popups-${userId}`)
       .on(
         'postgres_changes',
         {
-          event: '*',
+          event: 'INSERT',
           schema: 'public',
           table: 'notifications',
           filter: `user_id=eq.${userId}`,
         },
-        () => refresh(),
+        (payload) => {
+          const row = payload.new as PoolrNotification
+          setPopups((current) => [...current.slice(-3), row])
+        },
       )
       .subscribe()
 
     return () => {
-      cancelled = true
       void supabase.removeChannel(channel)
     }
   }, [userId])
 
-  return badge.userId === userId ? badge.count : 0
-}
-
-// Loads the user's newest notifications for the inbox page.
-export async function fetchNotifications(userId: string): Promise<PoolrNotification[]> {
-  const { data, error } = await supabase
-    .from('notifications')
-    .select('notification_id, user_id, type, title, body, trip_id, request_id, read_at, created_at')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(100)
-  if (error) throw new Error(error.message)
-  return (data ?? []) as PoolrNotification[]
-}
-
-// Marks one notification read (the RLS update policy allows a user to
-// update only their own rows).
-export async function markNotificationRead(notificationId: string): Promise<void> {
-  const { error } = await supabase
-    .from('notifications')
-    .update({ read_at: new Date().toISOString() })
-    .eq('notification_id', notificationId)
-    .is('read_at', null)
-  if (error) throw new Error(error.message)
-}
-
-// Marks every unread notification of the user read in one update.
-export async function markAllNotificationsRead(userId: string): Promise<void> {
-  const { error } = await supabase
-    .from('notifications')
-    .update({ read_at: new Date().toISOString() })
-    .eq('user_id', userId)
-    .is('read_at', null)
-  if (error) throw new Error(error.message)
+  return { popups, dismissPopup }
 }
