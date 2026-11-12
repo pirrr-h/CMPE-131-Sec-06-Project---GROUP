@@ -38,6 +38,14 @@
 //       One call for the Vehicles page: the caller's license state plus
 //       every vehicle with its documents and badge status.
 //
+// Verification failures also notify: a failed license check and a
+// failed vehicle document write a notification through the database's
+// notify_user helper, so the existing pop-up display and push drainer
+// tell the user even when they are not looking at the Vehicles page.
+// License failures are deduped per Stripe session (see
+// notifyLicenseFailure), so repeated status checks cannot stack
+// copies of the same failure.
+//
 // The fields on doc-submit are the values read off the document. In
 // this version the driver reads and types them (the uploader is the
 // person holding the document); the payload shape is exactly what an
@@ -185,6 +193,58 @@ async function markLicenseVerified(userId: string, name: string | null, expiry: 
   if (error) throw new Error("Could not save your license status. Try again.");
 }
 
+// Write one notification row for the user through the database helper
+// the trip workflows use, so the pop-up display and the push drainer
+// deliver it with no app changes. Best effort on purpose: a failed
+// notification write must never change the verification outcome, so
+// the result and any error are ignored here.
+async function notifyUser(userId: string, type: string, title: string, body: string) {
+  await admin.rpc("notify_user", {
+    p_user_id: userId,
+    p_type: type,
+    p_title: title,
+    p_body: body,
+    p_trip_id: null,
+    p_request_id: null,
+  });
+}
+
+// True when this license failure was already notified for the Stripe
+// session that produced it: a notification with the same type and
+// title written after the session was created means an earlier status
+// check already told the user. A later session has a later creation
+// time, so a genuinely new failure still notifies.
+async function licenseFailureAlreadyNotified(
+  userId: string,
+  title: string,
+  sessionCreatedUnix: number | null,
+) {
+  let query = admin
+    .from("notifications")
+    .select("created_at")
+    .eq("user_id", userId)
+    .eq("type", "license_verification_failed")
+    .eq("title", title);
+  if (sessionCreatedUnix) {
+    query = query.gt("created_at", new Date(sessionCreatedUnix * 1000).toISOString());
+  }
+  const { data } = await query.limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
+// Tell the user a license check failed, once per session and failure
+// kind, so status polling from the Vehicles page cannot spam them
+// with copies of the same failure.
+async function notifyLicenseFailure(
+  userId: string,
+  title: string,
+  body: string,
+  sessionCreatedUnix: number | null,
+) {
+  if (await licenseFailureAlreadyNotified(userId, title, sessionCreatedUnix)) return;
+  await notifyUser(userId, "license_verification_failed", title, body);
+}
+
 // Adopt the identity check the user already passed as their license
 // check when it qualifies: the identity session is verified, its
 // VerificationReport shows the document was a driving license, the
@@ -287,14 +347,43 @@ async function getLicenseStatus(userId: string) {
 
   const session = await stripe.identity.verificationSessions.retrieve(sessionId);
   if (session.status !== "verified") {
+    if (session.status === "canceled") {
+      await notifyLicenseFailure(
+        userId,
+        "Driver license check canceled",
+        "Your driver license check was canceled before it finished. Open Vehicles to start it again.",
+        session.created,
+      );
+    } else if (session.status === "requires_input" && session.last_error) {
+      await notifyLicenseFailure(
+        userId,
+        "Driver license check failed",
+        "Your last driver license check did not pass. Open Vehicles to see the state of the check and try again.",
+        session.created,
+      );
+    }
     return { licenseVerified: false, status: session.status };
   }
 
   const reportId = session.last_verification_report;
-  if (!reportId) return { licenseVerified: false, status: "missing_report" };
+  if (!reportId) {
+    await notifyLicenseFailure(
+      userId,
+      "Driver license check failed",
+      "We could not read the result of your driver license check. Open Vehicles to try again.",
+      session.created,
+    );
+    return { licenseVerified: false, status: "missing_report" };
+  }
   const report = await stripe.identity.verificationReports.retrieve(reportId);
   const doc = report.document;
   if (!doc || doc.status !== "verified" || !doc.first_name || !doc.last_name) {
+    await notifyLicenseFailure(
+      userId,
+      "Driver license check failed",
+      "Stripe could not verify the license document you scanned. Open Vehicles to try again with a clearer scan.",
+      session.created,
+    );
     return { licenseVerified: false, status: "document_not_verified" };
   }
 
@@ -302,6 +391,12 @@ async function getLicenseStatus(userId: string) {
   const licenseExpiry = stripeDateToIso(doc.expiration_date ?? null);
 
   if (licenseExpiry && isPastDate(licenseExpiry)) {
+    await notifyLicenseFailure(
+      userId,
+      "Driver license check failed",
+      `The driver license you scanned expired on ${licenseExpiry}, so the check did not pass.`,
+      session.created,
+    );
     return { licenseVerified: false, status: "license_expired", licenseName, licenseExpiry };
   }
 
@@ -311,6 +406,12 @@ async function getLicenseStatus(userId: string) {
       : "mismatch"
     : "skipped_test_mode";
   if (nameChecked === "mismatch") {
+    await notifyLicenseFailure(
+      userId,
+      "Driver license check failed",
+      "The name on your driver license does not match the name on your account, so the check did not pass.",
+      session.created,
+    );
     return { licenseVerified: false, status: "name_mismatch", licenseName, licenseExpiry };
   }
 
@@ -335,6 +436,13 @@ async function getOwnedVehicle(userId: string, vehicleId: unknown) {
   if (error || !data) throw new Error("Vehicle not found.");
   if (data.user_id !== userId) throw new Error("That vehicle belongs to a different account.");
   return data;
+}
+
+// Human-readable label for a vehicle document type, for messages.
+function docTypeTitle(docType: string) {
+  if (docType === "registration") return "Registration";
+  if (docType === "rental_agreement") return "Rental agreement";
+  return "Insurance";
 }
 
 // Run the automated cross-checks for one submitted document and return
@@ -445,6 +553,15 @@ async function submitDocument(
     { p_vehicle_id: vehicle.vehicle_id },
   );
   if (refreshError) throw new Error("Document saved, but the vehicle status could not refresh.");
+
+  if (checkStatus === "failed") {
+    await notifyUser(
+      userId,
+      "vehicle_document_failed",
+      "Vehicle document check failed",
+      `${docTypeTitle(docType)} did not pass: ${notes}. Open Vehicles to fix it and resubmit.`,
+    );
+  }
 
   return { docStatus: checkStatus, notes, vehicleStatus: status };
 }
