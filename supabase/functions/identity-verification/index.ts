@@ -1,6 +1,6 @@
 // Poolr Identity Verification — Supabase Edge Function
 //
-// Why this exists: rule is that a Poolr account gets access to
+// Why this exists: Kyaw's rule is that a Poolr account gets access to
 // nothing until the user's identity is verified. Verification runs through
 // Stripe Identity (a hosted document scan — the ID images go to Stripe,
 // never to this server or the database). When Stripe confirms the scan,
@@ -208,6 +208,10 @@ async function getVerificationStatus(userId: string) {
     await markVerified(userId);
     return { verified: true, status: "verified" };
   }
+  // A failed attempt returns the session to requires_input. Stripe
+  // usually attaches last_error, but a failed attempt can also come
+  // back carrying only its failed verification report, so the
+  // notification below accepts either shape as the failure signal.
   if (session.status === "canceled") {
     await notifyIdentityFailure(
       userId,
@@ -215,7 +219,10 @@ async function getVerificationStatus(userId: string) {
       "Your identity verification was canceled before it finished. Open Poolr to start it again.",
       session.created,
     );
-  } else if (session.status === "requires_input" && session.last_error) {
+  } else if (
+    session.status === "requires_input" &&
+    (session.last_error || session.last_verification_report)
+  ) {
     await notifyIdentityFailure(
       userId,
       "Identity verification failed",
