@@ -36,11 +36,12 @@ messaging.onBackgroundMessage((payload) => {
   return self.registration.showNotification(title, { body })
 })
 
-// Opens the inbox when a push is clicked: focuses an already-open
-// Poolr tab and navigates it to /notifications, or opens a new tab.
+// Opens the app when a push is clicked: focuses an already-open
+// Poolr tab and navigates it home, or opens a new tab. There is no
+// notifications page — pushes and in-app pop-ups are the whole UI.
 self.addEventListener('notificationclick', (event) => {
   event.notification.close()
-  const target = '/notifications'
+  const target = '/'
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
       for (const client of windowClients) {
