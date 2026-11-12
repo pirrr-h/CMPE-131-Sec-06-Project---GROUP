@@ -346,6 +346,10 @@ async function getLicenseStatus(userId: string) {
   if (!sessionId) return { licenseVerified: false, status: "not_started" };
 
   const session = await stripe.identity.verificationSessions.retrieve(sessionId);
+  // A failed attempt returns the session to requires_input. Stripe
+  // usually attaches last_error, but a failed attempt can also come
+  // back carrying only its failed verification report, so the
+  // notification below accepts either shape as the failure signal.
   if (session.status !== "verified") {
     if (session.status === "canceled") {
       await notifyLicenseFailure(
@@ -354,7 +358,10 @@ async function getLicenseStatus(userId: string) {
         "Your driver license check was canceled before it finished. Open Vehicles to start it again.",
         session.created,
       );
-    } else if (session.status === "requires_input" && session.last_error) {
+    } else if (
+      session.status === "requires_input" &&
+      (session.last_error || session.last_verification_report)
+    ) {
       await notifyLicenseFailure(
         userId,
         "Driver license check failed",
