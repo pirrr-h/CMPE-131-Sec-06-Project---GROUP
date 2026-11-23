@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Alert, Badge, Button, Card, Col, Form, ListGroup, Row } from 'react-bootstrap'
+import MapView from '../components/MapView'
 import { Link } from 'react-router-dom'
 import { geocode, getRoute } from '../lib/geocode'
 import { supabase } from '../lib/supabase'
+
 
 interface Vehicle {
   vehicle_id: string
@@ -54,7 +56,6 @@ export default function PublishRoute({ userId }: { userId: string }) {
       .then(({ data }) => {
         const list = (data as Vehicle[]) ?? []
         setVehicles(list)
-        if (list[0]) setVehicleId(list[0].vehicle_id)
       })
     fetchTrips(userId).then(({ data }) => setTrips((data as Trip[]) ?? []))
   }, [userId])
@@ -66,6 +67,10 @@ export default function PublishRoute({ userId }: { userId: string }) {
     e.preventDefault()
     setError('')
     setSuccess('')
+    if (!vehicleId) {
+      setError('Choose a vehicle for this trip.')
+      return
+    }
     if (new Date(departure).getTime() <= Date.now()) {
       setError('Departure time must be in the future.')
       return
@@ -133,6 +138,7 @@ export default function PublishRoute({ userId }: { userId: string }) {
                     setSeats(1)
                   }}
                 >
+                  <option value="">Select a vehicle…</option>
                   {vehicles.map((v) => (
                     <option key={v.vehicle_id} value={v.vehicle_id}>
                       {v.make} {v.model}
@@ -157,12 +163,13 @@ export default function PublishRoute({ userId }: { userId: string }) {
                 <Form.Control type="datetime-local" required value={departure} onChange={(e) => setDeparture(e.target.value)} />
               </Col>
             </Row>
-            <Button type="submit" className="mt-3" disabled={busy}>
+            <Button type="submit" className="mt-3" disabled={busy || !vehicleId}>
               {busy ? 'Publishing…' : 'Publish route'}
             </Button>
           </Form>
         </Card.Body>
       </Card>
+      <MapView origin={origin} destination={destination} />
 
       <h3>My published routes</h3>
       <ListGroup>
