@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import mapboxgl from 'mapbox-gl'
 import 'mapbox-gl/dist/mapbox-gl.css'
+import type { Feature, LineString } from 'geojson'
 
 interface MapViewProps {
   origin: string
@@ -105,7 +106,7 @@ export default function MapView({ origin, destination }: MapViewProps) {
 
       const coordinates = route.geometry.coordinates as [number, number][]
 
-      const geoJson: GeoJSON.Feature<GeoJSON.LineString> = {
+      const geoJson: Feature<LineString> = {
         type: 'Feature',
         properties: {},
         geometry: {
