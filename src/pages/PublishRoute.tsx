@@ -3,7 +3,9 @@ import type { FormEvent } from 'react'
 import { Alert, Badge, Button, Card, Col, Form, ListGroup, Row } from 'react-bootstrap'
 import { Link } from 'react-router-dom'
 import { geocode, getRoute } from '../lib/geocode'
+import type { Place } from '../lib/geocode'
 import { supabase } from '../lib/supabase'
+
 
 interface Vehicle {
   vehicle_id: string
@@ -40,6 +42,7 @@ export default function PublishRoute({ userId }: { userId: string }) {
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const [busy, setBusy] = useState(false)
+  const [matched, setMatched] = useState<{ from: Place; to: Place } | null>(null)
 
   const loadTrips = useCallback(async () => {
     const { data } = await fetchTrips(userId)
@@ -54,7 +57,6 @@ export default function PublishRoute({ userId }: { userId: string }) {
       .then(({ data }) => {
         const list = (data as Vehicle[]) ?? []
         setVehicles(list)
-        if (list[0]) setVehicleId(list[0].vehicle_id)
       })
     fetchTrips(userId).then(({ data }) => setTrips((data as Trip[]) ?? []))
   }, [userId])
@@ -66,14 +68,25 @@ export default function PublishRoute({ userId }: { userId: string }) {
     e.preventDefault()
     setError('')
     setSuccess('')
+    if (!vehicleId) {
+      setError('Choose a vehicle for this trip.')
+      return
+    }
     if (new Date(departure).getTime() <= Date.now()) {
       setError('Departure time must be in the future.')
       return
     }
     setBusy(true)
     try {
-      const from = await geocode(origin)
-      const to = await geocode(destination)
+      if (!matched) {
+        const from = await geocode(origin)
+        const to = await geocode(destination)
+        setMatched({ from, to })
+        setBusy(false)
+        return
+      }
+      const from = matched.from
+      const to = matched.to
       const route = await getRoute(from, to)
       const { error } = await supabase.from('trips').insert({
         creator_id: userId,
@@ -92,6 +105,7 @@ export default function PublishRoute({ userId }: { userId: string }) {
       })
       if (error) throw new Error(error.message)
       setSuccess('Route published! Riders nearby can now find it.')
+      setMatched(null)
       setOrigin('')
       setDestination('')
       loadTrips()
@@ -120,6 +134,16 @@ export default function PublishRoute({ userId }: { userId: string }) {
       <h2 className="mt-4">Publish a route</h2>
       {error && <Alert variant="danger">{error}</Alert>}
       {success && <Alert variant="success">{success}</Alert>}
+      {matched && (
+        <Alert variant="info">
+          <div>
+            <strong>Check the addresses we found:</strong>
+          </div>
+          <div>From: {matched.from.address}</div>
+          <div>To: {matched.to.address}</div>
+          <div>If either one is not the place you meant, edit it above and press Publish route again to re-check.</div>
+        </Alert>
+      )}
       <Card className="mb-4">
         <Card.Body>
           <Form onSubmit={publish}>
@@ -133,6 +157,7 @@ export default function PublishRoute({ userId }: { userId: string }) {
                     setSeats(1)
                   }}
                 >
+                  <option value="">Select a vehicle…</option>
                   {vehicles.map((v) => (
                     <option key={v.vehicle_id} value={v.vehicle_id}>
                       {v.make} {v.model}
@@ -146,19 +171,35 @@ export default function PublishRoute({ userId }: { userId: string }) {
               </Col>
               <Col md={6}>
                 <Form.Label>From</Form.Label>
-                <Form.Control required placeholder="e.g. 50 Phelan Ave, San Francisco" value={origin} onChange={(e) => setOrigin(e.target.value)} />
+                <Form.Control
+                  required
+                  placeholder="e.g. 50 Phelan Ave, San Francisco"
+                  value={origin}
+                  onChange={(e) => {
+                    setOrigin(e.target.value)
+                    setMatched(null)
+                  }}
+                />
               </Col>
               <Col md={6}>
                 <Form.Label>To</Form.Label>
-                <Form.Control required placeholder="e.g. 1 Washington Sq, San Jose" value={destination} onChange={(e) => setDestination(e.target.value)} />
+                <Form.Control
+                  required
+                  placeholder="e.g. 1 Washington Sq, San Jose"
+                  value={destination}
+                  onChange={(e) => {
+                    setDestination(e.target.value)
+                    setMatched(null)
+                  }}
+                />
               </Col>
               <Col md={6}>
                 <Form.Label>Departure</Form.Label>
                 <Form.Control type="datetime-local" required value={departure} onChange={(e) => setDeparture(e.target.value)} />
               </Col>
             </Row>
-            <Button type="submit" className="mt-3" disabled={busy}>
-              {busy ? 'Publishing…' : 'Publish route'}
+            <Button type="submit" className="mt-3" disabled={busy || !vehicleId}>
+              {busy ? 'Publishing…' : matched ? 'Confirm & publish' : 'Publish route'}
             </Button>
           </Form>
         </Card.Body>
