@@ -16,12 +16,9 @@
     "@stripe/stripe-js": "^10.2.0",
     "@supabase/supabase-js": "^2.118.0",
     "bootstrap": "^5.3.8",
-<<<<<<< HEAD
-    "firebase": "^13.3.0",
-    "mapbox-gl": "^3.33.0",
-=======
-    "mapbox-gl": "^3.34.2",
->>>>>>> feature/map-home
+  "firebase": "^13.3.0",
+  "mapbox-gl": "^3.34.2",
+
     "react": "^19.3.1",
     "react-bootstrap": "^2.10.10",
     "react-dom": "^19.3.1",
