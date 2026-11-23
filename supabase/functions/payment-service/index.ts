@@ -12,6 +12,19 @@
 //
 // Requires the Poolr-Payment-Alignment-Patch.sql on the database
 // (unique index on payments.request_id, enum values, widened guard map).
+//
+// Retry safety: every Stripe call below uses an idempotency key built
+// by the key-builder functions in this file (holdKey, captureKey,
+// transferKey, refundKey, partialRefundKey, releaseKey) — each key is
+// derived only from the request/payment identity and the operation, so
+// it is identical on every retry of the same logical operation. The
+// payment drainer carries identical copies of the builders, so the two
+// functions can never present different keys for the same operation.
+// On top of the keys, transfers and refunds are reconciled before they
+// are created (findExistingTransfer / findExistingRefund): a call whose
+// outcome was unknown — a timeout after Stripe had already acted — is
+// resolved by looking up what Stripe already has, so the retry adopts
+// the existing object instead of moving the money a second time.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import Stripe from "npm:stripe@17.7.0";
@@ -63,6 +76,86 @@ function dollarsToCents(value: number | string | null | undefined): number {
   const cents = Math.round(amount * 100);
   if (cents < 50) throw new Error("The payment amount is below Stripe's minimum.");
   return cents;
+}
+
+// The idempotency key for placing a ride request's payment hold.
+// Derived only from the request id, so every retry of the same hold —
+// from this function, from the payment drainer, or from the client
+// calling again after a timeout — presents the SAME key to Stripe, and
+// Stripe performs the authorization once. The v2 keeps this request
+// shape separate from the earlier one Stripe has on record: a key
+// cannot be reused with different parameters. The payment drainer
+// carries an identical copy of every key builder below; the two must
+// never drift apart, or the same logical operation could reach Stripe
+// under two different keys.
+function holdKey(requestId: string): string {
+  return `poolr-hold-v2-${requestId}`;
+}
+
+// The idempotency key for capturing one payment's held intent. Derived
+// only from the payment id, so a capture retried after a timeout is
+// the same operation to Stripe, never a second capture.
+function captureKey(paymentId: string): string {
+  return `poolr-capture-${paymentId}`;
+}
+
+// The idempotency key for the driver payout transfer of one payment.
+// Derived only from the payment id, so the transfer is created once
+// even if the first attempt's response was lost.
+function transferKey(paymentId: string): string {
+  return `poolr-transfer-${paymentId}`;
+}
+
+// The idempotency key for a full refund of one payment. A full refund
+// has one fixed amount (the whole fare), so the payment id alone
+// identifies the operation; Stripe also binds a key to the parameters
+// of its first use, so the same key can never move a different amount.
+function refundKey(paymentId: string): string {
+  return `poolr-refund-${paymentId}`;
+}
+
+// The idempotency key for the partial (policy) refund of one payment —
+// the refundPercent share paid back to the rider when a cancellation
+// settles through settlePartialOrNone. Kept distinct from the full
+// refund key so the two operations can never collide on one key.
+function partialRefundKey(paymentId: string): string {
+  return `poolr-prefund-${paymentId}`;
+}
+
+// The idempotency key for cancelling one payment's uncaptured intent
+// (releasing the hold). Derived only from the payment id, so a retried
+// release cancels once.
+function releaseKey(paymentId: string): string {
+  return `poolr-release-${paymentId}`;
+}
+
+// Finds the driver payout transfer a previous attempt already created
+// for this payment, or null when there is none. A create call whose
+// response was lost to a timeout leaves the transfer behind at Stripe
+// with our payment id in its metadata; checking before creating again
+// is what lets a retry reconcile instead of paying the driver twice.
+// (The idempotency key is the second line of defence, not the only
+// one.)
+async function findExistingTransfer(payment: PaymentRow) {
+  const transfers = await stripe.transfers.list({
+    transfer_group: `poolr_trip_${payment.trip_id}`,
+    limit: 100,
+  });
+  return transfers.data.find(
+    (t) => t.metadata?.poolr_payment_id === payment.payment_id && t.status !== "canceled",
+  ) ?? null;
+}
+
+// Finds a refund of the given amount that a previous attempt already
+// made against this payment intent, or null when there is none. Used
+// before creating a refund whose first attempt may have timed out:
+// if the money already went back, the retry adopts that refund
+// instead of sending a second one.
+async function findExistingRefund(paymentIntentId: string, amountCents: number) {
+  const refunds = await stripe.refunds.list({ payment_intent: paymentIntentId, limit: 100 });
+  return refunds.data.find(
+    (r) => r.amount === amountCents && (r.status === "succeeded" || r.status === "pending"),
+  ) ?? null;
 }
 
 // Verifies the request's Authorization token with Supabase Auth and
@@ -227,7 +320,7 @@ async function holdPayment(userId: string, requestId: string, paymentMethodId: s
       poolr_driver_id: trip.creator_id,
     },
     transfer_group: `poolr_trip_${request.trip_id}`,
-  }, { idempotencyKey: `poolr-hold-v2-${request.request_id}` });
+  }, { idempotencyKey: holdKey(request.request_id) });
 
   if (!["requires_action", "requires_capture", "succeeded"].includes(intent.status)) {
     throw new Error(`Payment authorization was not completed (status: ${intent.status}).`);
@@ -308,7 +401,7 @@ async function capturePayment(userId: string, paymentId: string) {
   let intent = await stripe.paymentIntents.retrieve(payment.stripe_payment_intent_id);
   if (intent.status === "requires_capture") {
     intent = await stripe.paymentIntents.capture(intent.id, {}, {
-      idempotencyKey: `poolr-capture-${payment.payment_id}`,
+      idempotencyKey: captureKey(payment.payment_id),
     });
   }
   if (intent.status !== "succeeded") {
@@ -335,14 +428,17 @@ async function capturePayment(userId: string, paymentId: string) {
     : intent.latest_charge?.id;
   if (!chargeId) throw new Error("Captured payment has no charge ID.");
 
-  const transfer = await stripe.transfers.create({
+  // Reconcile before creating: if an earlier attempt already made this
+  // transfer (and its response was lost), adopt it instead of paying
+  // the driver twice.
+  const transfer = await findExistingTransfer(payment) ?? await stripe.transfers.create({
     amount: payoutCents,
     currency: "usd",
     destination: driver.stripe_account_id,
     source_transaction: chargeId,
     transfer_group: `poolr_trip_${payment.trip_id}`,
     metadata: { poolr_payment_id: payment.payment_id, poolr_trip_id: payment.trip_id },
-  }, { idempotencyKey: `poolr-transfer-${payment.payment_id}` });
+  }, { idempotencyKey: transferKey(payment.payment_id) });
 
   const { error: updateError } = await admin
     .from("payments")
@@ -379,7 +475,7 @@ async function settlePartialOrNone(payment: PaymentRow, refundPercent: number) {
   let intent = await stripe.paymentIntents.retrieve(payment.stripe_payment_intent_id);
   if (intent.status === "requires_capture") {
     intent = await stripe.paymentIntents.capture(intent.id, {}, {
-      idempotencyKey: `poolr-capture-${payment.payment_id}`,
+      idempotencyKey: captureKey(payment.payment_id),
     });
   }
   if (intent.status !== "succeeded") {
@@ -405,12 +501,16 @@ async function settlePartialOrNone(payment: PaymentRow, refundPercent: number) {
   const driverPercent = 100 - refundPercent;
 
   if (refundPercent > 0) {
-    const refund = await stripe.refunds.create({
-      payment_intent: payment.stripe_payment_intent_id,
-      amount: Math.round(totalCents * refundPercent / 100),
-      reason: "requested_by_customer",
-      metadata: { poolr_payment_id: payment.payment_id },
-    }, { idempotencyKey: `poolr-prefund-${payment.payment_id}` });
+    const refundCents = Math.round(totalCents * refundPercent / 100);
+    // Reconcile before creating: adopt the refund an earlier timed-out
+    // attempt already made, rather than refunding the rider twice.
+    const refund = await findExistingRefund(payment.stripe_payment_intent_id, refundCents)
+      ?? await stripe.refunds.create({
+        payment_intent: payment.stripe_payment_intent_id,
+        amount: refundCents,
+        reason: "requested_by_customer",
+        metadata: { poolr_payment_id: payment.payment_id },
+      }, { idempotencyKey: partialRefundKey(payment.payment_id) });
     if (refund.status === "failed" || refund.status === "canceled") {
       throw new Error("Stripe could not refund this payment. Contact support.");
     }
@@ -426,14 +526,16 @@ async function settlePartialOrNone(payment: PaymentRow, refundPercent: number) {
   if (driverError || !driver?.stripe_account_id) {
     throw new Error("Driver payout account is missing. Refund done; driver share requires support.");
   }
-  const transfer = await stripe.transfers.create({
+  // Reconcile before creating: adopt an earlier attempt's transfer of
+  // the driver's share if one already reached Stripe.
+  const transfer = await findExistingTransfer(payment) ?? await stripe.transfers.create({
     amount: Math.round(totalCents * driverPercent / 100),
     currency: "usd",
     destination: driver.stripe_account_id,
     source_transaction: chargeId,
     transfer_group: `poolr_trip_${payment.trip_id}`,
     metadata: { poolr_payment_id: payment.payment_id, poolr_trip_id: payment.trip_id },
-  }, { idempotencyKey: `poolr-transfer-${payment.payment_id}` });
+  }, { idempotencyKey: transferKey(payment.payment_id) });
 
   const settledStatus = refundPercent === 0 ? "captured" : "partially_refunded";
   const { error: finalSaveError } = await admin
@@ -499,11 +601,16 @@ async function releasePayment(userId: string, paymentId: string, refundPercent =
   let wasCaptured = payment.payment_status === "captured";
 
   if (wasCaptured) {
-    const refund = await stripe.refunds.create({
-      payment_intent: payment.stripe_payment_intent_id,
-      reason: "requested_by_customer",
-      metadata: { poolr_payment_id: payment.payment_id },
-    }, { idempotencyKey: `poolr-refund-${payment.payment_id}` });
+    // Reconcile before creating: if an earlier attempt's full refund
+    // already reached Stripe (its response may have been lost), adopt
+    // it instead of refunding a second time.
+    const refund = (payment.stripe_payment_intent_id
+      ? await findExistingRefund(payment.stripe_payment_intent_id, dollarsToCents(payment.amount_total))
+      : null) ?? await stripe.refunds.create({
+        payment_intent: payment.stripe_payment_intent_id,
+        reason: "requested_by_customer",
+        metadata: { poolr_payment_id: payment.payment_id },
+      }, { idempotencyKey: refundKey(payment.payment_id) });
     if (refund.status === "failed" || refund.status === "canceled") {
       throw new Error("Stripe could not refund this payment. Contact support.");
     }
@@ -512,15 +619,20 @@ async function releasePayment(userId: string, paymentId: string, refundPercent =
     if (intent.status === "requires_capture" || intent.status === "requires_confirmation"
       || intent.status === "requires_payment_method") {
       await stripe.paymentIntents.cancel(intent.id, {}, {
-        idempotencyKey: `poolr-release-${payment.payment_id}`,
+        idempotencyKey: releaseKey(payment.payment_id),
       });
     } else if (intent.status === "succeeded") {
       wasCaptured = true;
-      await stripe.refunds.create({
-        payment_intent: intent.id,
-        reason: "requested_by_customer",
-        metadata: { poolr_payment_id: payment.payment_id },
-      }, { idempotencyKey: `poolr-refund-${payment.payment_id}` });
+      // Same reconcile-first rule as the branch above: adopt an
+      // existing full refund for this intent if one is already there.
+      const existingRefund = await findExistingRefund(intent.id, dollarsToCents(payment.amount_total));
+      if (!existingRefund) {
+        await stripe.refunds.create({
+          payment_intent: intent.id,
+          reason: "requested_by_customer",
+          metadata: { poolr_payment_id: payment.payment_id },
+        }, { idempotencyKey: refundKey(payment.payment_id) });
+      }
     }
   }
 

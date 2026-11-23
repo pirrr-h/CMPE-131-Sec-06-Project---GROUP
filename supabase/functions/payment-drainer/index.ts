@@ -41,12 +41,18 @@
 //     'processing' by a run that died mid-job is returned to 'pending'
 //     once its claim is 10 minutes old, so no job is stranded forever.
 //   - The Stripe calls below mirror payment-service's capture/release
-//     step for step and reuse the SAME idempotency keys
-//     (poolr-capture-<payment_id>, poolr-transfer-<payment_id>,
-//     poolr-release-<payment_id>, poolr-refund-<payment_id>,
-//     poolr-prefund-<payment_id>), so if this
-//     drainer and payment-service ever touch the same payment, Stripe
-//     still performs the money movement only once.
+//     step for step and reuse the SAME idempotency keys, built by the
+//     key-builder functions in this file (captureKey, transferKey,
+//     releaseKey, refundKey, partialRefundKey), which are identical
+//     copies of payment-service's builders — each key is derived only
+//     from the payment identity and the operation, so it is the same
+//     on every retry. If this drainer and payment-service ever touch
+//     the same payment, Stripe still performs the money movement only
+//     once. Transfers and refunds are also reconciled before they are
+//     created (findExistingTransfer / findExistingRefund): when a
+//     job's earlier attempt timed out after Stripe had already acted,
+//     the retry looks up what Stripe already has and adopts it instead
+//     of moving the money a second time.
 //   - Jobs whose payment is already in the target state (already captured
 //     and paid out, already released or refunded) are marked done without
 //     calling Stripe — running the drainer twice is harmless.
@@ -119,6 +125,7 @@ type PaymentJobRow = {
   attempts: number | null;
 };
 
+// json: turns a value into a JSON HTTP response with the given status.
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -135,6 +142,87 @@ function dollarsToCents(value: number | string | null | undefined): number {
   const cents = Math.round(amount * 100);
   if (cents < 50) throw new Error("The payment amount is below Stripe's minimum.");
   return cents;
+}
+
+// holdKey: the idempotency key for placing a ride request's payment
+// hold. The drainer never places holds, but the full key list is kept
+// identical to payment-service's on purpose: every key is derived only
+// from the request/payment identity and the operation, so any retry of
+// the same logical operation — by either function — presents the SAME
+// key to Stripe and the money moves once. If these builders ever
+// drifted apart from payment-service's copies, the same operation
+// could reach Stripe under two different keys.
+function holdKey(requestId: string): string {
+  return `poolr-hold-v2-${requestId}`;
+}
+
+// captureKey: the idempotency key for capturing one payment's held
+// intent, derived only from the payment id so a capture retried after
+// a timeout is the same operation to Stripe, never a second capture.
+function captureKey(paymentId: string): string {
+  return `poolr-capture-${paymentId}`;
+}
+
+// transferKey: the idempotency key for the driver payout transfer of
+// one payment, derived only from the payment id so the transfer is
+// created once even if the first attempt's response was lost.
+function transferKey(paymentId: string): string {
+  return `poolr-transfer-${paymentId}`;
+}
+
+// refundKey: the idempotency key for a full refund of one payment. A
+// full refund has one fixed amount (the whole fare), so the payment id
+// alone identifies the operation; Stripe also binds a key to the
+// parameters of its first use, so the same key can never move a
+// different amount.
+function refundKey(paymentId: string): string {
+  return `poolr-refund-${paymentId}`;
+}
+
+// partialRefundKey: the idempotency key for the partial (policy)
+// refund of one payment — the refund_percent share paid back to the
+// rider on a below-100 release job. Kept distinct from the full refund
+// key so the two operations can never collide on one key.
+function partialRefundKey(paymentId: string): string {
+  return `poolr-prefund-${paymentId}`;
+}
+
+// releaseKey: the idempotency key for cancelling one payment's
+// uncaptured intent (releasing the hold), derived only from the
+// payment id so a retried release cancels once.
+function releaseKey(paymentId: string): string {
+  return `poolr-release-${paymentId}`;
+}
+
+// findExistingTransfer: finds the driver payout transfer a previous
+// attempt already created for this payment, or null when there is
+// none. A create call whose response was lost to a timeout leaves the
+// transfer behind at Stripe with our payment id in its metadata;
+// checking before creating again is what lets a retried job reconcile
+// instead of paying the driver twice. The idempotency key is the
+// second line of defence, not the only one. Identical to
+// payment-service's helper of the same name.
+async function findExistingTransfer(payment: PaymentRow) {
+  const transfers = await stripe.transfers.list({
+    transfer_group: `poolr_trip_${payment.trip_id}`,
+    limit: 100,
+  });
+  return transfers.data.find(
+    (t) => t.metadata?.poolr_payment_id === payment.payment_id && t.status !== "canceled",
+  ) ?? null;
+}
+
+// findExistingRefund: finds a refund of the given amount that a
+// previous attempt already made against this payment intent, or null
+// when there is none. Used before creating a refund whose first
+// attempt may have timed out: if the money already went back, the
+// retry adopts that refund instead of sending a second one. Identical
+// to payment-service's helper of the same name.
+async function findExistingRefund(paymentIntentId: string, amountCents: number) {
+  const refunds = await stripe.refunds.list({ payment_intent: paymentIntentId, limit: 100 });
+  return refunds.data.find(
+    (r) => r.amount === amountCents && (r.status === "succeeded" || r.status === "pending"),
+  ) ?? null;
 }
 
 // getPayment: loads one payments row by id, or throws if it is gone.
@@ -174,7 +262,7 @@ async function captureForJob(payment: PaymentRow) {
   let intent = await stripe.paymentIntents.retrieve(payment.stripe_payment_intent_id);
   if (intent.status === "requires_capture") {
     intent = await stripe.paymentIntents.capture(intent.id, {}, {
-      idempotencyKey: `poolr-capture-${payment.payment_id}`,
+      idempotencyKey: captureKey(payment.payment_id),
     });
   }
   if (intent.status !== "succeeded") {
@@ -201,14 +289,17 @@ async function captureForJob(payment: PaymentRow) {
     : intent.latest_charge?.id;
   if (!chargeId) throw new Error("Captured payment has no charge ID.");
 
-  const transfer = await stripe.transfers.create({
+  // Reconcile before creating: if an earlier attempt already made this
+  // transfer (and its response was lost), adopt it instead of paying
+  // the driver twice.
+  const transfer = await findExistingTransfer(payment) ?? await stripe.transfers.create({
     amount: payoutCents,
     currency: "usd",
     destination: driver.stripe_account_id,
     source_transaction: chargeId,
     transfer_group: `poolr_trip_${payment.trip_id}`,
     metadata: { poolr_payment_id: payment.payment_id, poolr_trip_id: payment.trip_id },
-  }, { idempotencyKey: `poolr-transfer-${payment.payment_id}` });
+  }, { idempotencyKey: transferKey(payment.payment_id) });
 
   const { error: updateError } = await admin
     .from("payments")
@@ -243,7 +334,7 @@ async function settlePartialOrNone(payment: PaymentRow, refundPercent: number) {
   let intent = await stripe.paymentIntents.retrieve(payment.stripe_payment_intent_id);
   if (intent.status === "requires_capture") {
     intent = await stripe.paymentIntents.capture(intent.id, {}, {
-      idempotencyKey: `poolr-capture-${payment.payment_id}`,
+      idempotencyKey: captureKey(payment.payment_id),
     });
   }
   if (intent.status !== "succeeded") {
@@ -269,12 +360,16 @@ async function settlePartialOrNone(payment: PaymentRow, refundPercent: number) {
   const driverPercent = 100 - refundPercent;
 
   if (refundPercent > 0) {
-    const refund = await stripe.refunds.create({
-      payment_intent: payment.stripe_payment_intent_id,
-      amount: Math.round(totalCents * refundPercent / 100),
-      reason: "requested_by_customer",
-      metadata: { poolr_payment_id: payment.payment_id },
-    }, { idempotencyKey: `poolr-prefund-${payment.payment_id}` });
+    const refundCents = Math.round(totalCents * refundPercent / 100);
+    // Reconcile before creating: adopt the refund an earlier timed-out
+    // attempt already made, rather than refunding the rider twice.
+    const refund = await findExistingRefund(payment.stripe_payment_intent_id, refundCents)
+      ?? await stripe.refunds.create({
+        payment_intent: payment.stripe_payment_intent_id,
+        amount: refundCents,
+        reason: "requested_by_customer",
+        metadata: { poolr_payment_id: payment.payment_id },
+      }, { idempotencyKey: partialRefundKey(payment.payment_id) });
     if (refund.status === "failed" || refund.status === "canceled") {
       throw new Error("Stripe could not refund this payment. Contact support.");
     }
@@ -290,14 +385,16 @@ async function settlePartialOrNone(payment: PaymentRow, refundPercent: number) {
   if (driverError || !driver?.stripe_account_id) {
     throw new Error("Driver payout account is missing. Refund done; driver share requires support.");
   }
-  const transfer = await stripe.transfers.create({
+  // Reconcile before creating: adopt an earlier attempt's transfer of
+  // the driver's share if one already reached Stripe.
+  const transfer = await findExistingTransfer(payment) ?? await stripe.transfers.create({
     amount: Math.round(totalCents * driverPercent / 100),
     currency: "usd",
     destination: driver.stripe_account_id,
     source_transaction: chargeId,
     transfer_group: `poolr_trip_${payment.trip_id}`,
     metadata: { poolr_payment_id: payment.payment_id, poolr_trip_id: payment.trip_id },
-  }, { idempotencyKey: `poolr-transfer-${payment.payment_id}` });
+  }, { idempotencyKey: transferKey(payment.payment_id) });
 
   const settledStatus = refundPercent === 0 ? "captured" : "partially_refunded";
   const { error: finalSaveError } = await admin
@@ -357,11 +454,17 @@ async function releaseForJob(payment: PaymentRow, refundPercent = 100) {
 
   if (wasCaptured) {
     if (!payment.stripe_payment_intent_id) throw new Error("Payment has no Stripe PaymentIntent.");
-    const refund = await stripe.refunds.create({
+    // Reconcile before creating: if an earlier attempt's full refund
+    // already reached Stripe (its response may have been lost), adopt
+    // it instead of refunding a second time.
+    const refund = await findExistingRefund(
+      payment.stripe_payment_intent_id,
+      dollarsToCents(payment.amount_total),
+    ) ?? await stripe.refunds.create({
       payment_intent: payment.stripe_payment_intent_id,
       reason: "requested_by_customer",
       metadata: { poolr_payment_id: payment.payment_id },
-    }, { idempotencyKey: `poolr-refund-${payment.payment_id}` });
+    }, { idempotencyKey: refundKey(payment.payment_id) });
     if (refund.status === "failed" || refund.status === "canceled") {
       throw new Error("Stripe could not refund this payment. Contact support.");
     }
@@ -370,15 +473,20 @@ async function releaseForJob(payment: PaymentRow, refundPercent = 100) {
     if (intent.status === "requires_capture" || intent.status === "requires_confirmation"
       || intent.status === "requires_payment_method") {
       await stripe.paymentIntents.cancel(intent.id, {}, {
-        idempotencyKey: `poolr-release-${payment.payment_id}`,
+        idempotencyKey: releaseKey(payment.payment_id),
       });
     } else if (intent.status === "succeeded") {
       wasCaptured = true;
-      await stripe.refunds.create({
-        payment_intent: intent.id,
-        reason: "requested_by_customer",
-        metadata: { poolr_payment_id: payment.payment_id },
-      }, { idempotencyKey: `poolr-refund-${payment.payment_id}` });
+      // Same reconcile-first rule as the branch above: adopt an
+      // existing full refund for this intent if one is already there.
+      const existingRefund = await findExistingRefund(intent.id, dollarsToCents(payment.amount_total));
+      if (!existingRefund) {
+        await stripe.refunds.create({
+          payment_intent: intent.id,
+          reason: "requested_by_customer",
+          metadata: { poolr_payment_id: payment.payment_id },
+        }, { idempotencyKey: refundKey(payment.payment_id) });
+      }
     }
     // If the intent is already 'canceled' (e.g. the hold expired on its
     // own), no Stripe call is needed — the row update below closes out
