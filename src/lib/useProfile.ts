@@ -8,6 +8,8 @@ export interface Profile {
   user_id: string
   full_name: string | null
   role: Role
+  is_verified: boolean
+  driver_license_verified: boolean
 }
 
 // Tracks who is logged in and loads their profile row (including role).
@@ -36,7 +38,7 @@ export function useProfile() {
     if (!userId) return
     supabase
       .from('users')
-      .select('user_id, full_name, role')
+      .select('user_id, full_name, role, is_verified, driver_license_verified')
       .eq('user_id', userId)
       .single()
       .then(({ data }) => {
