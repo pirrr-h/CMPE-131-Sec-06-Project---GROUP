@@ -124,7 +124,7 @@ export default function Home({ userId, profile }: HomeProps) {
       return
     }
 
-    const currentRoute = routeData as RiderRoute
+    const currentRoute = routeData as unknown as RiderRoute
     setRoute(currentRoute)
 
     const { data, error: matchError } = await supabase.rpc(
