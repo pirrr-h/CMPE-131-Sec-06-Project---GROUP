@@ -195,7 +195,12 @@ export default function Home({ userId, profile }: HomeProps) {
     setLoading(false)
   }, [userId])
 
+  // Loads the matches for the chosen mode whenever the mode changes.
+  // The loaders reset the loading and message state before fetching,
+  // which the set-state-in-effect rule flags; that reset is intentional,
+  // so the rule is disabled for the loader call inside this effect.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (mode === 'rider') void loadRiderMatches()
     if (mode === 'driver') void loadRiderMatchesForDriver()
   }, [mode, loadRiderMatches, loadRiderMatchesForDriver])

@@ -144,18 +144,6 @@ function dollarsToCents(value: number | string | null | undefined): number {
   return cents;
 }
 
-// holdKey: the idempotency key for placing a ride request's payment
-// hold. The drainer never places holds, but the full key list is kept
-// identical to payment-service's on purpose: every key is derived only
-// from the request/payment identity and the operation, so any retry of
-// the same logical operation — by either function — presents the SAME
-// key to Stripe and the money moves once. If these builders ever
-// drifted apart from payment-service's copies, the same operation
-// could reach Stripe under two different keys.
-function holdKey(requestId: string): string {
-  return `poolr-hold-v2-${requestId}`;
-}
-
 // captureKey: the idempotency key for capturing one payment's held
 // intent, derived only from the payment id so a capture retried after
 // a timeout is the same operation to Stripe, never a second capture.
