@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Alert, Badge, Button, Card, Col, Form, ListGroup, Row } from 'react-bootstrap'
+import MapView from '../components/MapView'
 import { Link } from 'react-router-dom'
 import { geocode, getRoute } from '../lib/geocode'
 import type { Place } from '../lib/geocode'
@@ -204,6 +205,7 @@ export default function PublishRoute({ userId }: { userId: string }) {
           </Form>
         </Card.Body>
       </Card>
+      <MapView origin={origin} destination={destination} />
 
       <h3>My published routes</h3>
       <ListGroup>

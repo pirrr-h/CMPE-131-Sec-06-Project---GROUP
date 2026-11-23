@@ -16,15 +16,21 @@
     "@stripe/stripe-js": "^10.2.0",
     "@supabase/supabase-js": "^2.118.0",
     "bootstrap": "^5.3.8",
+<<<<<<< HEAD
     "firebase": "^13.3.0",
     "mapbox-gl": "^3.33.0",
+=======
+    "mapbox-gl": "^3.34.2",
+>>>>>>> feature/map-home
     "react": "^19.3.1",
     "react-bootstrap": "^2.10.10",
     "react-dom": "^19.3.1",
-    "react-router-dom": "^7.18.4"
+    "react-router-dom": "^7.18.4",
+    "supabase": "^3.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/geojson": "^7946.0.16",
     "@types/jest": "^29.5.14",
     "@types/node": "^24.19.2",
     "@types/react": "^19.3.0",
