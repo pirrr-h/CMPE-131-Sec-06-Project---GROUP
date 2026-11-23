@@ -5,7 +5,6 @@ import { unregisterPushNotifications, usePushRegistration } from './lib/notifica
 import { useProfile } from './lib/useProfile'
 import NotificationPopups from './components/NotificationPopups'
 import Auth from './pages/Auth'
-import FindTrips from './pages/FindTrips'
 import Home from './pages/Home'
 import LetsGo from './pages/LetsGo'
 import PaymentSetup from './pages/PaymentSetup'
@@ -69,7 +68,6 @@ export default function App() {
           <Navbar.Brand as={Link} to="/">Poolr</Navbar.Brand>
           <Nav className="me-auto">
             <Nav.Link as={Link} to="/">Home</Nav.Link>
-            {canRide && <Nav.Link as={Link} to="/find">Find a trip</Nav.Link>}
             {canRide && <Nav.Link as={Link} to="/lets-go">Let&apos;s Go!</Nav.Link>}
             {canDrive && <Nav.Link as={Link} to="/vehicles">Vehicles</Nav.Link>}
             {canDrive && <Nav.Link as={Link} to="/publish">Publish route</Nav.Link>}
@@ -86,7 +84,6 @@ export default function App() {
           <Route path="/verify" element={<Navigate to="/" replace />} />
           <Route path="/" element={<Home userId={userId} profile={profile} />} />
           <Route path="/payments" element={<PaymentSetup userId={userId} />} />
-          {canRide && <Route path="/find" element={<FindTrips userId={userId} />} />}
           {canRide && <Route path="/lets-go" element={<LetsGo userId={userId} />} />}
           {canDrive ? (
             <>
